@@ -1,0 +1,15 @@
+node_modules/
+.wrangler/
+.dev.vars
+dist/
+
+# Local-only planning notes, not part of the deployed worker
+implementation_plan/
+.claude/
+
+# Agent / assistant guides kept local
+CLAUDE.md
+AGENTS.md
+
+# Local secrets and token records
+LOCAL_TOKENS.md

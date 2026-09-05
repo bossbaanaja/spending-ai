@@ -1,0 +1,21 @@
+{
+  "name": "spending-ai",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types",
+    "check": "tsc --noEmit",
+    "db:apply": "wrangler d1 execute spending_ai --remote --file=src/db/schema.sql",
+    "db:apply:local": "wrangler d1 execute spending_ai --local --file=src/db/schema.sql"
+  },
+  "dependencies": {
+    "grammy": "^1.30.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "wrangler": "^4.0.0"
+  }
+}
