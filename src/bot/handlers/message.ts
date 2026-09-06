@@ -92,7 +92,7 @@ export function registerMessage(bot: Bot<BotContext>) {
 
         if (myShare === null) {
           await ctx.reply(
-            "I couldn't understand that amount. Please type a number (e.g. 2280 or 2800 - 520), or /cancel to cancel.",
+            "I couldn't understand that amount. Please type a number (e.g. You actually paid 5,000 or 5,500 - 500), or /cancel to cancel.",
           );
           return;
         }
