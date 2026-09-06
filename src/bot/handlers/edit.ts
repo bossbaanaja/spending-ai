@@ -15,7 +15,7 @@ import { asCategory } from "../../types";
 import { advanceNoteWalk, finishNoteWalk, startNoteWalk } from "../batch";
 import type { BotContext } from "../bot";
 import { fmtAmount, formatTxCard } from "../card";
-import { splitCountKeyboard, splitModeKeyboard, txKeyboard } from "../keyboards";
+import { splitCountKeyboard, splitModeKeyboard, txKeyboard, undoConfirmKeyboard } from "../keyboards";
 
 /** Inline-button callbacks (change category, split, delete) + /undo. */
 export function registerEdit(bot: Bot<BotContext>) {
@@ -212,16 +212,68 @@ export function registerEdit(bot: Bot<BotContext>) {
       await ctx.reply("Nothing to undo — no entries yet.");
       return;
     }
-    // A month-split leaves several rows; drop the whole group, not just one part.
-    const removed = latest.split_group
-      ? await deleteSplitGroup(ctx.env.DB, latest.split_group, user.id)
-      : ((await deleteTransaction(ctx.env.DB, latest.id, user.id)) ? 1 : 0);
-    // Quote what actually leaves the books: for a split group that's the whole
-    // pre-split amount, not the single instalment the card happens to show.
-    const amount = removed > 1 ? (latest.original_amount ?? latest.amount) : latest.amount;
-    const parts = removed > 1 ? ` (all ${removed} monthly parts)` : "";
+
+    // Build a human-readable preview so the user knows exactly what will go.
+    const amount = latest.split_group
+      ? (latest.original_amount ?? latest.amount)
+      : latest.amount;
+    const parts = latest.split_group ? ` (all monthly parts)` : "";
+    const label = `${fmtAmount(amount, latest.currency)}${parts} — ${latest.category}${latest.note ? ` (${latest.note})` : ""}`;
+
+    // Encode the deletion target: split_group string or numeric id.
+    const key = latest.split_group ?? String(latest.id);
+
     await ctx.reply(
-      `↩️ Removed ${fmtAmount(amount, latest.currency)}${parts} (${latest.category}${latest.note ? ` — ${latest.note}` : ""}).`,
+      `↩️ Remove this entry?\n\n${label}`,
+      { reply_markup: undoConfirmKeyboard(key) },
     );
   });
+
+  // User confirmed — now actually delete.
+  bot.callbackQuery(/^undoconfirm:(.+)$/, async (ctx) => {
+    const user = ctx.dbUser;
+    if (!user) return;
+
+    const key = ctx.match[1] ?? "";
+    const asId = Number(key);
+    let removed: number;
+    let amount: number;
+    let currency: string;
+    let label: string;
+
+    if (!Number.isNaN(asId)) {
+      // Single transaction.
+      const tx = await getTransaction(ctx.env.DB, asId, user.id);
+      const deleted = await deleteTransaction(ctx.env.DB, asId, user.id);
+      removed = deleted ? 1 : 0;
+      amount = tx?.amount ?? 0;
+      currency = tx?.currency ?? "THB";
+      label = tx
+        ? `${fmtAmount(tx.amount, tx.currency)} — ${tx.category}${tx.note ? ` (${tx.note})` : ""}`
+        : "(already gone)";
+    } else {
+      // Month-split group — fetch one row first for the display amount.
+      const tx = await getLatestTransaction(ctx.env.DB, user.id);
+      removed = await deleteSplitGroup(ctx.env.DB, key, user.id);
+      amount = tx?.original_amount ?? tx?.amount ?? 0;
+      currency = tx?.currency ?? "THB";
+      label = tx
+        ? `${fmtAmount(tx.original_amount ?? tx.amount, tx.currency)} all ${removed} parts — ${tx.category}${tx.note ? ` (${tx.note})` : ""}`
+        : "(already gone)";
+    }
+
+    await ctx.answerCallbackQuery({ text: removed > 0 ? "Deleted." : "Already gone." });
+    if (removed > 0) {
+      await ctx.editMessageText(`🗑 Removed: ${label}`);
+    } else {
+      await ctx.editMessageText("That entry was already gone.");
+    }
+  });
+
+  // User cancelled.
+  bot.callbackQuery("undocancel", async (ctx) => {
+    await ctx.answerCallbackQuery({ text: "Cancelled." });
+    await ctx.editMessageText("Okay — nothing deleted.");
+  });
 }
+

@@ -57,3 +57,15 @@ export function splitCountKeyboard(txId: number, mode: "splitp" | "splitm"): Inl
   });
   return kb.row().text("◀️ Back", `split:${txId}`);
 }
+
+/**
+ * Shown by /undo before anything is deleted.
+ * `key` is either a numeric transaction id (single entry) or a split_group
+ * string (month-split group), encoded in the callback data so the confirm
+ * handler knows what to wipe.
+ */
+export function undoConfirmKeyboard(key: string): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("✅ Yes, delete", `undoconfirm:${key}`)
+    .text("❌ Cancel", "undocancel");
+}
