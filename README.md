@@ -11,6 +11,7 @@ An intelligent Telegram spending tracker built for **Cloudflare Workers**. It au
 - 🛡️ **Duplicate Detection**: Uses transaction reference numbers from slips to prevent logging the same payment twice.
 - ✂️ **Instant Bill Splitting**:
   - **👥 Between People**: Paid for a group? Keep only your share (e.g. ฿1,200 ÷ 4 = ฿300) and drop the rest from your totals.
+  - **✏️ Custom Share ("My share was…")**: Non-equal split? Type the exact net amount you paid (e.g. `2280` or `2800 - 520`) when someone covers part of the bill.
   - **🗓 Across Months**: Large annual payment (e.g. car insurance)? Spread it into equal monthly portions across future months.
   - **↩️ Undo Split**: Reverts splits back to the original amount at any time.
 - 📊 **Monthly Dashboard & Charts**: `/dashboard` displays spending totals, category breakdowns, and top merchants with an auto-generated visual chart. Past months can be viewed via `/dashboard YYYY-MM`.
@@ -134,7 +135,7 @@ For full end-user documentation, see [USER_MANUAL.md](file:///C:/Users/nutch/Des
 | `/dashboard YYYY-MM` | View a specific past month's dashboard (e.g. `/dashboard 2026-06`) |
 | `/undo` | Immediately delete the last logged transaction |
 | tap category button | Correct an entry's assigned category |
-| tap ✂️ Split | Split a bill among friends or amortize across multiple months |
+| tap ✂️ Split | Split a bill among friends (equal or custom share) or amortize across multiple months |
 | tap ↩️ Undo split | Revert a split back to original slip value |
 | tap 🗑 Delete | Delete a transaction (or all parts of a month split) |
 

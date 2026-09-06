@@ -66,9 +66,9 @@ Every saved entry comes back as a confirmation card with buttons underneath:
 
 ## 4. Splitting a bill — ✂️ Split
 
-Sometimes one slip isn't really one spend. Every saved entry has a **✂️ Split** button for the two common cases. Tap it, pick the kind, then tap how many — no typing.
+Sometimes one slip isn't really one spend. Every saved entry has a **✂️ Split** button with three options:
 
-### 👥 Between people — *you paid for the group*
+### 👥 Between people — *equal split for the group*
 
 You covered a ฿1,200 dinner for four. Tap **✂️ Split → 👥 Between people → 4**, and the entry becomes **฿300** — your share. The other ฿900 was never your money, so it's simply dropped and never counts in your totals.
 
@@ -77,6 +77,22 @@ The card then shows a reminder of what happened:
 ✅ Saved ฿300 — Food
 👥 My share — ฿1,200 ÷ 4 people
 ```
+
+### ✏️ My share was… — *non-equal split / custom amount*
+
+You paid a ฿2,800 bill, but a friend paid ฿520 for their portion (so your net share was only ฿2,280). Tap **✂️ Split → ✏️ My share was…**, and the bot prompts:
+> *"How much was actually yours? Reply with the amount (e.g. 2280 or 2800 - 520)."*
+
+Reply with either:
+- The exact amount: `2280` (or `2,280` or `฿2280`)
+- Or simple arithmetic: `2800 - 520`
+
+The entry updates to **฿2,280**, leaving a clear record on the card:
+```
+✅ Saved ฿2,280 — Food
+✏️ My share — ฿2,800 on the slip
+```
+If you change your mind during the prompt, tap **◀️ Back** or send `/cancel`.
 
 ### 🗓 Across months — *one payment covering many months*
 
