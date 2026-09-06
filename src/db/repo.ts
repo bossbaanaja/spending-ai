@@ -169,6 +169,32 @@ export async function splitByPeople(
 }
 
 /**
+ * "My share was X": sets the amount to the user's typed figure, keeping
+ * original_amount so undo restores the whole slip. split_total is NULL
+ * to distinguish this custom amount from equal N-person splits.
+ */
+export async function splitByCustom(
+  db: D1Database,
+  id: number,
+  userId: number,
+  myShare: number,
+): Promise<TransactionRow | null> {
+  const tx = await getTransaction(db, id, userId);
+  if (!tx) return null;
+
+  return await db
+    .prepare(
+      `UPDATE transactions
+          SET amount = ?, original_amount = COALESCE(original_amount, amount),
+              split_kind = 'people', split_part = 1, split_total = NULL
+        WHERE id = ? AND user_id = ?
+       RETURNING *`,
+    )
+    .bind(myShare, id, userId)
+    .first<TransactionRow>();
+}
+
+/**
  * Spreads one payment across N months as N rows, one dated in each month, so
  * every existing per-month query picks up the right slice without changes.
  * Applied after a people-split it spreads the user's share, not the full slip.
@@ -362,6 +388,41 @@ export async function getPending(db: D1Database, userId: number): Promise<Pendin
 
 export async function deletePending(db: D1Database, userId: number): Promise<void> {
   await db.prepare("DELETE FROM pending_slips WHERE user_id = ?").bind(userId).run();
+}
+
+// ---------- pending splits (custom amount) ----------
+
+export interface PendingSplitRow {
+  id: number;
+  user_id: number;
+  tx_id: number;
+  message_id: number | null;
+  created_at: string;
+}
+
+export async function setPendingCustomSplit(
+  db: D1Database,
+  userId: number,
+  txId: number,
+  messageId: number | null,
+): Promise<void> {
+  await db.batch([
+    db.prepare("DELETE FROM pending_splits WHERE user_id = ?").bind(userId),
+    db
+      .prepare("INSERT INTO pending_splits (user_id, tx_id, message_id) VALUES (?, ?, ?)")
+      .bind(userId, txId, messageId),
+  ]);
+}
+
+export async function getPendingCustomSplit(db: D1Database, userId: number): Promise<PendingSplitRow | null> {
+  return await db
+    .prepare("SELECT * FROM pending_splits WHERE user_id = ? ORDER BY id DESC LIMIT 1")
+    .bind(userId)
+    .first<PendingSplitRow>();
+}
+
+export async function deletePendingCustomSplit(db: D1Database, userId: number): Promise<void> {
+  await db.prepare("DELETE FROM pending_splits WHERE user_id = ?").bind(userId).run();
 }
 
 // ---------- slip batches (photo albums) ----------

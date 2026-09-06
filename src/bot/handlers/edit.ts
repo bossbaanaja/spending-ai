@@ -1,9 +1,11 @@
 import type { Bot } from "grammy";
 import {
+  deletePendingCustomSplit,
   deleteSplitGroup,
   deleteTransaction,
   getLatestTransaction,
   getTransaction,
+  setPendingCustomSplit,
   splitByMonths,
   splitByPeople,
   undoSplit,
@@ -15,7 +17,13 @@ import { asCategory } from "../../types";
 import { advanceNoteWalk, finishNoteWalk, startNoteWalk } from "../batch";
 import type { BotContext } from "../bot";
 import { fmtAmount, formatTxCard } from "../card";
-import { splitCountKeyboard, splitModeKeyboard, txKeyboard, undoConfirmKeyboard } from "../keyboards";
+import {
+  splitCountKeyboard,
+  splitCustomCancelKeyboard,
+  splitModeKeyboard,
+  txKeyboard,
+  undoConfirmKeyboard,
+} from "../keyboards";
 
 /** Inline-button callbacks (change category, split, delete) + /undo. */
 export function registerEdit(bot: Bot<BotContext>) {
@@ -50,15 +58,18 @@ export function registerEdit(bot: Bot<BotContext>) {
   bot.callbackQuery(/^split:(\d+)$/, async (ctx) => {
     const user = ctx.dbUser;
     if (!user) return;
+    await deletePendingCustomSplit(ctx.env.DB, user.id);
     const tx = await getTransaction(ctx.env.DB, Number(ctx.match[1]), user.id);
     if (!tx) {
       await ctx.answerCallbackQuery({ text: "That entry no longer exists." });
       return;
     }
+    const total = tx.original_amount ?? tx.amount;
     await ctx.answerCallbackQuery();
     await ctx.editMessageText(
-      `Split ${fmtAmount(tx.amount, tx.currency)}${tx.note ? ` (${tx.note})` : ""} — how?\n\n` +
+      `Split ${fmtAmount(total, tx.currency)}${tx.note ? ` (${tx.note})` : ""} — how?\n\n` +
         "👥 Between people — you paid for the group, keep only your share.\n" +
+        "✏️ My share was… — enter the exact amount you paid.\n" +
         "🗓 Across months — one payment that covers several months.",
       { reply_markup: splitModeKeyboard(tx.id) },
     );
@@ -66,6 +77,8 @@ export function registerEdit(bot: Bot<BotContext>) {
 
   // Step 2: how many ways? Same grid for both kinds, different prefix.
   bot.callbackQuery(/^(splitp|splitm):(\d+)$/, async (ctx) => {
+    const user = ctx.dbUser;
+    if (user) await deletePendingCustomSplit(ctx.env.DB, user.id);
     const mode = ctx.match[1] as "splitp" | "splitm";
     const txId = Number(ctx.match[2]);
     await ctx.answerCallbackQuery();
@@ -77,10 +90,34 @@ export function registerEdit(bot: Bot<BotContext>) {
     );
   });
 
+  // Step 2c: custom share — prompt the user for the amount
+  bot.callbackQuery(/^splitc:(\d+)$/, async (ctx) => {
+    const user = ctx.dbUser;
+    if (!user) return;
+    const txId = Number(ctx.match[1]);
+    const tx = await getTransaction(ctx.env.DB, txId, user.id);
+    if (!tx) {
+      await ctx.answerCallbackQuery({ text: "That entry no longer exists." });
+      return;
+    }
+
+    const total = tx.original_amount ?? tx.amount;
+    const messageId = ctx.callbackQuery.message?.message_id ?? null;
+    await setPendingCustomSplit(ctx.env.DB, user.id, txId, messageId);
+
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(
+      `Split ${fmtAmount(total, tx.currency)}${tx.note ? ` (${tx.note})` : ""} — my share\n\n` +
+        "How much was actually yours? Reply with the amount (e.g. 2280 or 2800 - 520).",
+      { reply_markup: splitCustomCancelKeyboard(txId) },
+    );
+  });
+
   // Step 3a: keep my share.
   bot.callbackQuery(/^splitp:(\d+):(\d+)$/, async (ctx) => {
     const user = ctx.dbUser;
     if (!user) return;
+    await deletePendingCustomSplit(ctx.env.DB, user.id);
     const ways = Number(ctx.match[2]);
     if (!isSplitCount(ways)) {
       await ctx.answerCallbackQuery({ text: "That isn't a split I can do." });
@@ -100,6 +137,7 @@ export function registerEdit(bot: Bot<BotContext>) {
   bot.callbackQuery(/^splitm:(\d+):(\d+)$/, async (ctx) => {
     const user = ctx.dbUser;
     if (!user) return;
+    await deletePendingCustomSplit(ctx.env.DB, user.id);
     const months = Number(ctx.match[2]);
     if (!isSplitCount(months)) {
       await ctx.answerCallbackQuery({ text: "That isn't a split I can do." });
@@ -121,6 +159,7 @@ export function registerEdit(bot: Bot<BotContext>) {
   bot.callbackQuery(/^unsplit:(\d+)$/, async (ctx) => {
     const user = ctx.dbUser;
     if (!user) return;
+    await deletePendingCustomSplit(ctx.env.DB, user.id);
 
     const restored = await undoSplit(ctx.env.DB, Number(ctx.match[1]), user.id);
     if (!restored) {
@@ -134,6 +173,7 @@ export function registerEdit(bot: Bot<BotContext>) {
   bot.callbackQuery(/^delgrp:(.+)$/, async (ctx) => {
     const user = ctx.dbUser;
     if (!user) return;
+    await deletePendingCustomSplit(ctx.env.DB, user.id);
 
     const removed = await deleteSplitGroup(ctx.env.DB, ctx.match[1] ?? "", user.id);
     await ctx.answerCallbackQuery({ text: removed > 0 ? "Deleted." : "Already gone." });
@@ -144,6 +184,7 @@ export function registerEdit(bot: Bot<BotContext>) {
   bot.callbackQuery(/^splitback:(\d+)$/, async (ctx) => {
     const user = ctx.dbUser;
     if (!user) return;
+    await deletePendingCustomSplit(ctx.env.DB, user.id);
     const tx = await getTransaction(ctx.env.DB, Number(ctx.match[1]), user.id);
     await ctx.answerCallbackQuery();
     if (tx) await ctx.editMessageText(formatTxCard(tx), { reply_markup: txKeyboard(tx) });

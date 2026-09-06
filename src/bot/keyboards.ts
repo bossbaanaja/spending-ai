@@ -43,9 +43,17 @@ export function batchAskKeyboard(batchId: number): InlineKeyboard {
 export function splitModeKeyboard(txId: number): InlineKeyboard {
   return new InlineKeyboard()
     .text("👥 Between people", `splitp:${txId}`)
+    .row()
+    .text("✏️ My share was…", `splitc:${txId}`)
+    .row()
     .text("🗓 Across months", `splitm:${txId}`)
     .row()
     .text("◀️ Back", `splitback:${txId}`);
+}
+
+/** Step 2c: cancel/back button shown during custom-share prompt. */
+export function splitCustomCancelKeyboard(txId: number): InlineKeyboard {
+  return new InlineKeyboard().text("◀️ Back", `splitback:${txId}`);
 }
 
 /** Step 2: how many ways. `mode` is the callback prefix — "splitp" or "splitm". */

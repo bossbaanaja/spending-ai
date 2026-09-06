@@ -1,10 +1,20 @@
 import type { Bot } from "grammy";
-import { deletePending, getActiveBatch, getPending } from "../../db/repo";
+import {
+  deletePending,
+  deletePendingCustomSplit,
+  getActiveBatch,
+  getPending,
+  getPendingCustomSplit,
+  getTransaction,
+  splitByCustom,
+} from "../../db/repo";
+import { parseCustomAmount } from "../../split";
 import type { ParsedSlip } from "../../types";
 import { runAssistant } from "../assistant";
 import { answerAskNote, completeBatchWithNote } from "../batch";
 import type { BotContext } from "../bot";
-import { saveParsedSlip } from "../card";
+import { fmtAmount, formatTxCard, saveParsedSlip } from "../card";
+import { txKeyboard } from "../keyboards";
 
 /**
  * Plain-text fallback, registered last so real commands win. Answers whatever
@@ -18,6 +28,26 @@ export function registerMessage(bot: Bot<BotContext>) {
     const user = ctx.dbUser;
     if (!user) return;
     const text = ctx.message.text.trim();
+
+    // Escape hatch: user wants to cancel whatever was waiting on them.
+    if (text.toLowerCase() === "/cancel" || text.toLowerCase() === "cancel" || text === "ยกเลิก") {
+      const pendingSplit = await getPendingCustomSplit(ctx.env.DB, user.id);
+      if (pendingSplit) {
+        await deletePendingCustomSplit(ctx.env.DB, user.id);
+        if (pendingSplit.message_id && ctx.chat) {
+          const tx = await getTransaction(ctx.env.DB, pendingSplit.tx_id, user.id);
+          if (tx) {
+            await ctx.api
+              .editMessageText(ctx.chat.id, pendingSplit.message_id, formatTxCard(tx), {
+                reply_markup: txKeyboard(tx),
+              })
+              .catch(() => {});
+          }
+        }
+        await ctx.reply("Split cancelled.");
+        return;
+      }
+    }
 
     // Unknown command — don't consume it as a slip note or a question.
     if (text.startsWith("/")) {
@@ -40,6 +70,67 @@ export function registerMessage(bot: Bot<BotContext>) {
         await ctx.reply("😕 I couldn't finish saving those slips — please try that note again.");
       }
       return;
+    }
+
+    // A custom split waiting on the user's share amount.
+    const pendingSplit = await getPendingCustomSplit(ctx.env.DB, user.id);
+    if (pendingSplit) {
+      const created = Date.parse(`${pendingSplit.created_at.replace(" ", "T")}Z`);
+      const isExpired = !Number.isNaN(created) && Date.now() - created > 15 * 60 * 1000;
+      if (isExpired) {
+        await deletePendingCustomSplit(ctx.env.DB, user.id);
+      } else {
+        const tx = await getTransaction(ctx.env.DB, pendingSplit.tx_id, user.id);
+        if (!tx) {
+          await deletePendingCustomSplit(ctx.env.DB, user.id);
+          await ctx.reply("That entry no longer exists.");
+          return;
+        }
+
+        const slipTotal = tx.original_amount ?? tx.amount;
+        const myShare = parseCustomAmount(text);
+
+        if (myShare === null) {
+          await ctx.reply(
+            "I couldn't understand that amount. Please type a number (e.g. 2280 or 2800 - 520), or /cancel to cancel.",
+          );
+          return;
+        }
+
+        if (myShare <= 0) {
+          await ctx.reply("Your share must be more than ฿0. Please type a valid amount, or /cancel to cancel.");
+          return;
+        }
+
+        if (myShare > slipTotal) {
+          await ctx.reply(
+            `That's more than the ${fmtAmount(slipTotal, tx.currency)} on the slip. Your share can't exceed the total.`,
+          );
+          return;
+        }
+
+        const updated = await splitByCustom(ctx.env.DB, tx.id, user.id, myShare);
+        await deletePendingCustomSplit(ctx.env.DB, user.id);
+
+        if (!updated) {
+          await ctx.reply("Couldn't update that entry — please try again.");
+          return;
+        }
+
+        // Restore and update the card message in place
+        if (pendingSplit.message_id && ctx.chat) {
+          await ctx.api
+            .editMessageText(ctx.chat.id, pendingSplit.message_id, formatTxCard(updated), {
+              reply_markup: txKeyboard(updated),
+            })
+            .catch(() => {});
+        }
+
+        await ctx.reply(
+          `✅ Saved your share: ${fmtAmount(updated.amount, updated.currency)} (slip was ${fmtAmount(slipTotal, tx.currency)}).`,
+        );
+        return;
+      }
     }
 
     const pending = await getPending(ctx.env.DB, user.id);

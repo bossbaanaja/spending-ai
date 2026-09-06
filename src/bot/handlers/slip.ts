@@ -1,5 +1,5 @@
 import type { Bot, InlineKeyboard } from "grammy";
-import { setPending } from "../../db/repo";
+import { deletePendingCustomSplit, setPending } from "../../db/repo";
 import { parseSlip } from "../../services/slipParser";
 import { downloadPhotoBase64 } from "../../services/telegramFile";
 import { SlipTimer } from "../../services/timing";
@@ -12,6 +12,9 @@ export function registerSlip(bot: Bot<BotContext>) {
   bot.on("message:photo", async (ctx) => {
     const user = ctx.dbUser;
     if (!user) return;
+
+    // A new photo replaces any active custom split prompt.
+    await deletePendingCustomSplit(ctx.env.DB, user.id);
 
     // Second-largest size: plenty of resolution for slip text, and reliably
     // under NIM's ~180KB inline-image limit (the largest size can exceed it).

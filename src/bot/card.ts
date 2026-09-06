@@ -29,8 +29,11 @@ export function formatTxCard(tx: TransactionRow): string {
 export function formatSplitLine(tx: TransactionRow): string | null {
   const paid = tx.original_amount !== null ? fmtAmount(tx.original_amount, tx.currency) : null;
 
-  if (tx.split_kind === "people" && tx.split_total) {
-    return `👥 My share — ${paid ?? "slip"} ÷ ${tx.split_total} people`;
+  if (tx.split_kind === "people") {
+    if (tx.split_total) {
+      return `👥 My share — ${paid ?? "slip"} ÷ ${tx.split_total} people`;
+    }
+    return `✏️ My share — ${paid ?? "slip"} on the slip`;
   }
   // No "of ฿X" here: after a people-split the pre-split amount is the whole slip,
   // not the sum being spread, and a subtly wrong total is worse than no total.

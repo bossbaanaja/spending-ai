@@ -8,6 +8,57 @@ export function isSplitCount(n: number): boolean {
 }
 
 /**
+ * Parses a custom split amount or simple subtraction/addition expression from user input.
+ * Supports plain numbers ("2280", "2,280.50"), currency symbols ("฿2280", "2280 thb"),
+ * Thai numerals ("๒๒๘๐"), and simple math ("2800 - 520", "1000 + 500").
+ * Returns null if the text cannot be cleanly parsed as a valid numeric amount.
+ */
+export function parseCustomAmount(input: string): number | null {
+  if (!input) return null;
+  // Convert Thai numerals to Arabic numerals (0-9)
+  let clean = input.trim().replace(/[๐-๙]/g, (d) => String("๐๑๒๓๔๕๖๗๘๙".indexOf(d)));
+
+  // Strip currency words/symbols from start or end
+  clean = clean.replace(/^(฿|thb|baht|บาท)\s*/i, "").replace(/\s*(฿|thb|baht|บาท)$/i, "");
+
+  // Remove thousand-separator commas
+  clean = clean.replace(/,/g, "");
+
+  clean = clean.trim();
+  if (!clean) return null;
+
+  // Only allow digits, '.', '+', '-', and whitespace
+  if (!/^[\d.\s+-]+$/.test(clean)) return null;
+
+  // Reject consecutive operators like "--", "+-", "++", "-+"
+  if (/[+-]{2,}/.test(clean.replace(/\s+/g, ""))) return null;
+
+  // Prefix leading number with + if not already prefixed
+  const signed = clean.startsWith("+") || clean.startsWith("-") ? clean : `+${clean}`;
+
+  // Match items like: (+|-) followed by digits and optional decimal part
+  const tokens = signed.match(/[+-]\s*\d+(?:\.\d+)?/g);
+  if (!tokens) return null;
+
+  // Verify that the tokens together account for the entire string
+  const reconstructed = tokens.join("").replace(/\s+/g, "");
+  if (reconstructed !== signed.replace(/\s+/g, "")) {
+    return null;
+  }
+
+  let sum = 0;
+  for (const token of tokens) {
+    const compact = token.replace(/\s+/g, "");
+    const sign = compact[0] === "-" ? -1 : 1;
+    const val = parseFloat(compact.slice(1));
+    if (isNaN(val)) return null;
+    sum += sign * val;
+  }
+
+  return Math.round(sum * 100) / 100;
+}
+
+/**
  * Divides an amount into n parts without losing satang: the maths is done in
  * integer satang and the rounding remainder lands on the first part, so the
  * parts always add back up to exactly `total` (฿1,000 ÷ 3 → 333.34, 333.33, 333.33).

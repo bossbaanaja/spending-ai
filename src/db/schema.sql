@@ -73,3 +73,17 @@ CREATE TABLE IF NOT EXISTS slip_batch_items (
   UNIQUE (batch_id, message_id)     -- a redelivered update can't register the same photo twice
 );
 CREATE INDEX IF NOT EXISTS idx_batch_items_batch ON slip_batch_items(batch_id, message_id);
+
+-- ---------- pending splits (custom amount) ----------
+-- Holds the split state while we wait for the user to type how much their share was.
+-- One pending split per user at a time.
+CREATE TABLE IF NOT EXISTS pending_splits (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  tx_id INTEGER NOT NULL REFERENCES transactions(id),
+  message_id INTEGER,               -- the split prompt message, so we can edit it in place
+  created_at TEXT DEFAULT (datetime('now')),
+  UNIQUE (user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_pending_splits_user ON pending_splits(user_id);
+
