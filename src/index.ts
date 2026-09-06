@@ -35,6 +35,19 @@ export default {
 
       if (seenUpdates.has(update.update_id)) return new Response("ok");
       seenUpdates.add(update.update_id);
+
+      // Arrival timing — logged before any processing so the timestamp is
+      // as close to actual receipt as possible.
+      const mediaGroupId = (update as { message?: { media_group_id?: string } }).message?.media_group_id;
+      if (mediaGroupId) {
+        console.error(JSON.stringify({
+          event: "album_photo_arrived",
+          update_id: update.update_id,
+          media_group_id: mediaGroupId,
+          arrived_at: Date.now(),
+          arrived_iso: new Date().toISOString(),
+        }));
+      }
       if (seenUpdates.size > 1000) {
         for (const id of seenUpdates) {
           seenUpdates.delete(id);

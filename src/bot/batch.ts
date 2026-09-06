@@ -77,11 +77,11 @@ const HEDGE_MAX_SLIPS = 1;
  */
 const ALBUM_NIM_TIMEOUT_MS = 25_000;
 const DEBOUNCE_STEP_MS = 700;
-const DEBOUNCE_MAX_MS = 4_000;
+const DEBOUNCE_MAX_MS = 10_000;
 /**
  * Shared cutoff for reading every slip in the album. Shorter than the 65s a
- * lone slip gets, because the debounce has already spent a second or two of
- * the update's ~80s lifetime and the summary still has to be sent.
+ * lone slip gets, because the debounce can now spend up to 10s waiting for
+ * slow mobile uploads to finish arriving, and the summary still has to be sent.
  */
 const PARSE_BUDGET_MS = 58_000;
 
@@ -101,6 +101,7 @@ export interface AlbumPhoto {
  */
 export async function handleAlbumPhoto(api: Api, env: Env, user: UserRow, photo: AlbumPhoto): Promise<void> {
   const db = env.DB;
+  const registeredAt = Date.now();
   const claimed = await claimBatch(db, user.id, photo.mediaGroupId, photo.chatId, photo.caption);
   const batch = claimed ?? (await getBatchByGroup(db, user.id, photo.mediaGroupId));
   if (!batch) throw new Error(`album ${photo.mediaGroupId}: lost the claim but found no batch row`);
@@ -109,6 +110,16 @@ export async function handleAlbumPhoto(api: Api, env: Env, user: UserRow, photo:
   // Telegram attaches the caption to one photo of the album, which is not
   // necessarily the one that won the claim.
   if (photo.caption && !claimed) await setBatchCaption(db, batch.id, photo.caption);
+
+  console.error(JSON.stringify({
+    event: "album_photo_registered",
+    role: claimed ? "leader" : "follower",
+    batch_id: batch.id,
+    media_group_id: photo.mediaGroupId,
+    message_id: photo.messageId,
+    registered_at: registeredAt,
+    registered_iso: new Date(registeredAt).toISOString(),
+  }));
 
   if (!claimed) return; // follower: someone else is driving this album
   await runBatch(api, env, user, batch);
@@ -211,16 +222,48 @@ async function runBatch(api: Api, env: Env, user: UserRow, claimed: SlipBatchRow
  * the summary counts it among the "weren't processed" slips.
  */
 async function settleAlbum(db: D1Database, batchId: number): Promise<number> {
-  const until = Date.now() + DEBOUNCE_MAX_MS;
+  const startedAt = Date.now();
+  const until = startedAt + DEBOUNCE_MAX_MS;
   let count = await countBatchItems(db, batchId);
   let stable = 0;
+  let poll = 0;
+
+  console.error(JSON.stringify({
+    event: "settle_album_start",
+    batch_id: batchId,
+    initial_count: count,
+    started_at: startedAt,
+    started_iso: new Date(startedAt).toISOString(),
+    debounce_max_ms: DEBOUNCE_MAX_MS,
+  }));
 
   while (stable < 2 && count < MAX_BATCH_SLIPS && Date.now() < until) {
     await sleep(DEBOUNCE_STEP_MS);
     const now = await countBatchItems(db, batchId);
+    const elapsed = Date.now() - startedAt;
+    poll += 1;
+    console.error(JSON.stringify({
+      event: "settle_album_poll",
+      batch_id: batchId,
+      poll,
+      count_before: count,
+      count_now: now,
+      stable: now === count ? stable + 1 : 0,
+      elapsed_ms: elapsed,
+    }));
     stable = now === count ? stable + 1 : 0;
     count = now;
   }
+
+  console.error(JSON.stringify({
+    event: "settle_album_done",
+    batch_id: batchId,
+    final_count: count,
+    total_polls: poll,
+    elapsed_ms: Date.now() - startedAt,
+    exit_reason: count >= MAX_BATCH_SLIPS ? "cap_reached" : stable >= 2 ? "stable" : "timeout",
+  }));
+
   return count;
 }
 
