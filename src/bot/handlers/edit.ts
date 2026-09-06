@@ -108,8 +108,17 @@ export function registerEdit(bot: Bot<BotContext>) {
     await ctx.answerCallbackQuery();
     await ctx.editMessageText(
       `Split ${fmtAmount(total, tx.currency)}${tx.note ? ` (${tx.note})` : ""} — my share\n\n` +
-        "How much was actually yours? Reply with the amount (e.g. 2280 or 2800 - 520).",
+        "Reply with your share below (or tap Back to cancel).",
       { reply_markup: splitCustomCancelKeyboard(txId) },
+    );
+    await ctx.reply(
+      `How much was actually yours? Reply with the amount (e.g. 2280 or 2800 - 520):`,
+      {
+        reply_markup: {
+          force_reply: true,
+          input_field_placeholder: "e.g. 2280 or 2800 - 520",
+        },
+      },
     );
   });
 

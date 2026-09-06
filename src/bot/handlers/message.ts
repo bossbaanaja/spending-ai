@@ -92,19 +92,39 @@ export function registerMessage(bot: Bot<BotContext>) {
 
         if (myShare === null) {
           await ctx.reply(
-            "I couldn't understand that amount. Please type a number (e.g. You actually paid 5,000 or 5,500 - 500), or /cancel to cancel.",
+            "I couldn't understand that amount. Please type a number (e.g. 2280 or 2800 - 520), or /cancel to cancel.",
+            {
+              reply_markup: {
+                force_reply: true,
+                input_field_placeholder: "e.g. 2280 or 2800 - 520",
+              },
+            },
           );
           return;
         }
 
         if (myShare <= 0) {
-          await ctx.reply("Your share must be more than ฿0. Please type a valid amount, or /cancel to cancel.");
+          await ctx.reply(
+            "Your share must be more than ฿0. Please type a valid amount, or /cancel to cancel.",
+            {
+              reply_markup: {
+                force_reply: true,
+                input_field_placeholder: "e.g. 2280 or 2800 - 520",
+              },
+            },
+          );
           return;
         }
 
         if (myShare > slipTotal) {
           await ctx.reply(
             `That's more than the ${fmtAmount(slipTotal, tx.currency)} on the slip. Your share can't exceed the total.`,
+            {
+              reply_markup: {
+                force_reply: true,
+                input_field_placeholder: "e.g. 2280 or 2800 - 520",
+              },
+            },
           );
           return;
         }
