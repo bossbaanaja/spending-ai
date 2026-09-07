@@ -56,34 +56,18 @@ import { batchAskKeyboard, batchNoteKeyboard, txKeyboard } from "./keyboards";
  */
 const MAX_BATCH_SLIPS = 10;
 /**
- * How many slips are read at once. Both providers rate-limit one key's
- * simultaneous requests (measured 2026-08-26: Typhoon rejects past ~3 at
- * once with instant 429s; NIM allows only 1–2 in flight per model, with a
- * seconds-long penalty window). At 5, every slip after the first burned its
- * retries inside that window and died — 2 stays under both ceilings.
- */
-const PARSE_CONCURRENCY = 2;
-/**
- * Hedge only a lone slip. An album's slips already run in parallel, and
- * doubling their model calls is exactly what blew through NIM's per-key rate
- * window (measured: 4 simultaneous calls → 1 answer, 3 rejections).
- */
-const HEDGE_MAX_SLIPS = 1;
-/**
  * Per-attempt cap for an album slip's NIM call (a lone slip keeps the 45s
- * default — its hedge twin covers a stall). Healthy answers measured 1.5–34s;
- * a stalled model must cost ~25s of the shared budget, not 45, so the retry
- * loop still has time to rotate to a model that answers.
+ * default — its hedge twin covers a stall).
  */
-const ALBUM_NIM_TIMEOUT_MS = 25_000;
-const DEBOUNCE_STEP_MS = 700;
+const ALBUM_NIM_TIMEOUT_MS = 20_000;
+const DEBOUNCE_STEP_MS = 600;
+const MIN_DEBOUNCE_MS = 2_500;
 const DEBOUNCE_MAX_MS = 10_000;
 /**
- * Shared cutoff for reading every slip in the album. Shorter than the 65s a
- * lone slip gets, because the debounce can now spend up to 10s waiting for
- * slow mobile uploads to finish arriving, and the summary still has to be sent.
+ * Shared cutoff for reading slips in the album before Cloudflare Worker
+ * lifetime forces termination.
  */
-const PARSE_BUDGET_MS = 58_000;
+const PARSE_BUDGET_MS = 55_000;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -138,9 +122,9 @@ async function runBatch(api: Api, env: Env, user: UserRow, claimed: SlipBatchRow
       status.message_id,
       text,
       keyboard ? { reply_markup: keyboard } : undefined,
-    );
+    ).catch(() => {});
 
-  // saveAll writes one row at a time, so a crash partway through leaves some
+  // Progressive saving writes rows as they finish, so a crash partway through leaves some
   // entries in the ledger. The error message must not claim otherwise.
   let mayHaveWritten = false;
 
@@ -151,28 +135,93 @@ async function runBatch(api: Api, env: Env, user: UserRow, claimed: SlipBatchRow
     const all = await listBatchItems(db, batch.id);
     const items = all.slice(0, MAX_BATCH_SLIPS);
     const overflow = all.slice(MAX_BATCH_SLIPS);
-    const skipped = overflow.length;
-
-    const { readable, failed } = await readSlips(env, batch, items, overflow);
-
-    if (readable.length === 0) {
-      await setBatchState(db, batch.id, "done");
-      await editStatus(
-        "😕 I couldn't read any of those slips. Try sending clearer photos — or send them one at a time.",
-      );
-      logBatch(batch, { slips: items.length, saved: 0, duplicates: 0, failed, skipped, ms: Date.now() - startedAt });
-      return;
-    }
+    const deadline = startedAt + PARSE_BUDGET_MS;
+    const unreadOverflow = [...overflow];
 
     if (batch.caption) {
       mayHaveWritten = true;
-      const { saved, duplicates } = await saveAll(db, user.id, readable, batch.caption);
+      const saved: TransactionRow[] = [];
+      let duplicates = 0;
+      let failed = 0;
+
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (!item) continue;
+
+        // Stop if not enough budget left for another slip (download + OCR + NIM takes ~6-8s)
+        if (deadline - Date.now() < 7_000) {
+          console.error(
+            JSON.stringify({ event: "batch_deadline_cutoff", item_id: item.id, remaining_ms: deadline - Date.now() }),
+          );
+          for (let j = i; j < items.length; j++) {
+            const rem = items[j];
+            if (rem) unreadOverflow.push(rem);
+          }
+          break;
+        }
+
+        if (items.length > 1) {
+          await editStatus(`🔍 Reading slip ${i + 1} of ${items.length}…`);
+        }
+
+        try {
+          const image = await downloadPhotoBase64(env.BOT_TOKEN, item.file_id);
+          const slip = await parseSlip(image, batch.caption, env, undefined, {
+            deadline,
+            hedge: false,
+            startIndex: 0,
+            nimTimeoutMs: ALBUM_NIM_TIMEOUT_MS,
+          });
+
+          // Progressive save: write row immediately to D1
+          const result = await insertTransaction(db, user.id, slip, batch.caption);
+          if (result === "duplicate") {
+            duplicates += 1;
+            await setItemResult(db, item.id, "duplicate", null, batch.caption);
+          } else {
+            saved.push(result);
+            await setItemResult(db, item.id, "saved", result.id, batch.caption);
+            // Send confirmation card immediately to chat
+            await api
+              .sendMessage(batch.chat_id, formatTxCard(result), { reply_markup: txKeyboard(result) })
+              .catch((err) => {
+                console.error(JSON.stringify({ event: "slip_batch_card_failed", tx: result.id, error: String(err) }));
+              });
+          }
+        } catch (err) {
+          failed += 1;
+          await setItemResult(db, item.id, "failed", null, batch.caption);
+          console.error(
+            JSON.stringify({ event: "slip_batch_item_failed", batch: batch.id, item: item.id, error: String(err) }),
+          );
+        }
+      }
+
+      if (unreadOverflow.length > 0) {
+        await setItemsParsed(
+          db,
+          unreadOverflow.map((ov) => ({ itemId: ov.id, parsedJson: null, outcome: "skipped" })),
+        );
+      }
+
       await setBatchState(db, batch.id, "done");
-      // A photo that registered after the debounce closed was never read.
-      // Counting it here is the difference between "2 more weren't processed"
-      // and a slip vanishing without a word.
-      const late = skipped + (await countUnreadItems(db, batch.id));
-      await renderResult(api, batch, editStatus, { saved, duplicates, failed, skipped: late });
+      const late = unreadOverflow.length + (await countUnreadItems(db, batch.id));
+
+      if (saved.length === 0 && duplicates === 0) {
+        await editStatus(
+          "😕 I couldn't read any of those slips. Try sending clearer photos — or send them one at a time.",
+        );
+      } else {
+        const heading =
+          saved.length === 0
+            ? "⚠️ Nothing new to log"
+            : `✅ Logged ${saved.length} slip${saved.length === 1 ? "" : "s"}`;
+        await editStatus(
+          formatBatchSummary({ saved, duplicates, failed, skipped: late }, heading),
+          saved.length > 1 ? batchNoteKeyboard(batch.id) : undefined,
+        );
+      }
+
       logBatch(batch, {
         slips: items.length,
         saved: saved.length,
@@ -184,13 +233,79 @@ async function runBatch(api: Api, env: Env, user: UserRow, claimed: SlipBatchRow
       return;
     }
 
-    // No caption: hold the whole album and ask once. One waiting slot per
-    // user, so this supersedes any single slip still waiting for its note.
+    // No caption: read slips sequentially, then ask once.
+    const readable: ReadSlip[] = [];
+    const outcomes: { itemId: number; parsedJson: string | null; outcome: BatchItemOutcome }[] = [];
+    let failed = 0;
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (!item) continue;
+
+      if (deadline - Date.now() < 7_000) {
+        console.error(
+          JSON.stringify({ event: "batch_deadline_cutoff", item_id: item.id, remaining_ms: deadline - Date.now() }),
+        );
+        for (let j = i; j < items.length; j++) {
+          const rem = items[j];
+          if (rem) unreadOverflow.push(rem);
+        }
+        break;
+      }
+
+      if (items.length > 1) {
+        await editStatus(`🔍 Reading slip ${i + 1} of ${items.length}…`);
+      }
+
+      try {
+        const image = await downloadPhotoBase64(env.BOT_TOKEN, item.file_id);
+        const slip = await parseSlip(image, "", env, undefined, {
+          deadline,
+          hedge: false,
+          startIndex: 0,
+          nimTimeoutMs: ALBUM_NIM_TIMEOUT_MS,
+        });
+        readable.push({ item, slip });
+        outcomes.push({ itemId: item.id, parsedJson: JSON.stringify(slip), outcome: "queued" });
+      } catch (err) {
+        failed += 1;
+        outcomes.push({ itemId: item.id, parsedJson: null, outcome: "failed" });
+        console.error(
+          JSON.stringify({ event: "slip_batch_item_failed", batch: batch.id, item: item.id, error: String(err) }),
+        );
+      }
+    }
+
+    for (const ov of unreadOverflow) {
+      outcomes.push({ itemId: ov.id, parsedJson: null, outcome: "skipped" });
+    }
+
+    if (outcomes.length > 0) {
+      await setItemsParsed(db, outcomes);
+    }
+
+    if (readable.length === 0) {
+      await setBatchState(db, batch.id, "done");
+      await editStatus(
+        "😕 I couldn't read any of those slips. Try sending clearer photos — or send them one at a time.",
+      );
+      logBatch(batch, {
+        slips: items.length,
+        saved: 0,
+        duplicates: 0,
+        failed,
+        skipped: unreadOverflow.length,
+        ms: Date.now() - startedAt,
+      });
+      return;
+    }
+
     await setBatchState(db, batch.id, "awaiting_note");
     await deletePending(db, user.id);
     const slips = readable.map((entry) => entry.slip);
+    const late = unreadOverflow.length + (await countUnreadItems(db, batch.id));
     await editStatus(
-      askNoteText(slips, { failed, skipped }),
+      askNoteText(slips, { failed, skipped: late }),
       slips.length > 1 ? batchNoteKeyboard(batch.id) : undefined,
     );
     logBatch(batch, {
@@ -198,7 +313,7 @@ async function runBatch(api: Api, env: Env, user: UserRow, claimed: SlipBatchRow
       saved: 0,
       duplicates: 0,
       failed,
-      skipped,
+      skipped: late,
       ms: Date.now() - startedAt,
       outcome: "awaiting_note",
     });
@@ -209,17 +324,13 @@ async function runBatch(api: Api, env: Env, user: UserRow, claimed: SlipBatchRow
       mayHaveWritten
         ? "😕 Something went wrong partway through those slips. Check /dashboard — some of them may already be logged."
         : "😕 Something went wrong reading those slips. Send them again in a moment — nothing was saved.",
-    ).catch(() => {});
+    );
   }
 }
 
 /**
- * Waits for the album's other updates to check in. Telegram gives no "this
- * album has N photos" signal, so the only workable rule is "stop when the
- * arrivals stop": two unchanged counts in a row, 4s, or the cap — whichever
- * comes first. Usually settles in ~1.5s. A straggler arriving after the
- * window still registers as a follower of this batch; it is never read, and
- * the summary counts it among the "weren't processed" slips.
+ * Waits for the album's other updates to check in. Enforces a minimum arrival
+ * window so slower mobile network uploads are not prematurely cut off.
  */
 async function settleAlbum(db: D1Database, batchId: number): Promise<number> {
   const startedAt = Date.now();
@@ -228,41 +339,51 @@ async function settleAlbum(db: D1Database, batchId: number): Promise<number> {
   let stable = 0;
   let poll = 0;
 
-  console.error(JSON.stringify({
-    event: "settle_album_start",
-    batch_id: batchId,
-    initial_count: count,
-    started_at: startedAt,
-    started_iso: new Date(startedAt).toISOString(),
-    debounce_max_ms: DEBOUNCE_MAX_MS,
-  }));
+  console.error(
+    JSON.stringify({
+      event: "settle_album_start",
+      batch_id: batchId,
+      initial_count: count,
+      started_at: startedAt,
+      started_iso: new Date(startedAt).toISOString(),
+      debounce_max_ms: DEBOUNCE_MAX_MS,
+    }),
+  );
 
-  while (stable < 2 && count < MAX_BATCH_SLIPS && Date.now() < until) {
+  while (
+    (Date.now() - startedAt < MIN_DEBOUNCE_MS || stable < 2) &&
+    count < MAX_BATCH_SLIPS &&
+    Date.now() < until
+  ) {
     await sleep(DEBOUNCE_STEP_MS);
     const now = await countBatchItems(db, batchId);
     const elapsed = Date.now() - startedAt;
     poll += 1;
-    console.error(JSON.stringify({
-      event: "settle_album_poll",
-      batch_id: batchId,
-      poll,
-      count_before: count,
-      count_now: now,
-      stable: now === count ? stable + 1 : 0,
-      elapsed_ms: elapsed,
-    }));
+    console.error(
+      JSON.stringify({
+        event: "settle_album_poll",
+        batch_id: batchId,
+        poll,
+        count_before: count,
+        count_now: now,
+        stable: now === count ? stable + 1 : 0,
+        elapsed_ms: elapsed,
+      }),
+    );
     stable = now === count ? stable + 1 : 0;
     count = now;
   }
 
-  console.error(JSON.stringify({
-    event: "settle_album_done",
-    batch_id: batchId,
-    final_count: count,
-    total_polls: poll,
-    elapsed_ms: Date.now() - startedAt,
-    exit_reason: count >= MAX_BATCH_SLIPS ? "cap_reached" : stable >= 2 ? "stable" : "timeout",
-  }));
+  console.error(
+    JSON.stringify({
+      event: "settle_album_done",
+      batch_id: batchId,
+      final_count: count,
+      total_polls: poll,
+      elapsed_ms: Date.now() - startedAt,
+      exit_reason: count >= MAX_BATCH_SLIPS ? "cap_reached" : stable >= 2 ? "stable" : "timeout",
+    }),
+  );
 
   return count;
 }
@@ -270,92 +391,6 @@ async function settleAlbum(db: D1Database, batchId: number): Promise<number> {
 interface ReadSlip {
   item: SlipBatchItemRow;
   slip: ParsedSlip;
-}
-
-/** Reads every photo through the normal two-stage pipeline; one bad slip never blocks the rest. */
-async function readSlips(
-  env: Env,
-  batch: SlipBatchRow,
-  items: SlipBatchItemRow[],
-  overflow: SlipBatchItemRow[],
-): Promise<{ readable: ReadSlip[]; failed: number }> {
-  const deadline = Date.now() + PARSE_BUDGET_MS;
-  const hedge = items.length <= HEDGE_MAX_SLIPS;
-
-  const results = await mapPool(items, PARSE_CONCURRENCY, async (item, slot) => {
-    const image = await downloadPhotoBase64(env.BOT_TOKEN, item.file_id);
-    // Start each pool slot on its own model: NIM's rate limit is per model, so
-    // the slips in flight must sit in different queues. Keyed to the slot, not
-    // the slip's position — a worker that runs ahead would otherwise land on
-    // the same model as the slower one (observed: slips 0 and 2 both opening
-    // on minimax-m3, both rejected). One slip per slot means one model each.
-    return await parseSlip(image, batch.caption ?? "", env, undefined, {
-      deadline,
-      hedge,
-      startIndex: slot,
-      nimTimeoutMs: hedge ? undefined : ALBUM_NIM_TIMEOUT_MS,
-    });
-  });
-
-  const readable: ReadSlip[] = [];
-  const outcomes: { itemId: number; parsedJson: string | null; outcome: BatchItemOutcome }[] = [];
-  let failed = 0;
-
-  results.forEach((result, i) => {
-    const item = items[i];
-    if (!item) return;
-    if (result.status === "fulfilled") {
-      readable.push({ item, slip: result.value });
-      outcomes.push({ itemId: item.id, parsedJson: JSON.stringify(result.value), outcome: "queued" });
-    } else {
-      failed += 1;
-      outcomes.push({ itemId: item.id, parsedJson: null, outcome: "failed" });
-      console.error(
-        JSON.stringify({ event: "slip_batch_item_failed", batch: batch.id, error: String(result.reason) }),
-      );
-    }
-  });
-
-  // Past the cap: recorded as skipped so the summary can still account for
-  // them after the user answers the note, long after this function is gone.
-  for (const item of overflow) {
-    outcomes.push({ itemId: item.id, parsedJson: null, outcome: "skipped" });
-  }
-
-  await setItemsParsed(env.DB, outcomes);
-  return { readable, failed };
-}
-
-/**
- * Runs `fn` over `items` with at most `limit` in flight, never rejecting.
- * `fn` also receives its pool slot (0..limit-1) — a stable identity for the
- * one job running there, which is what lets callers give each concurrent job
- * a different external resource.
- */
-async function mapPool<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T, slot: number) => Promise<R>,
-): Promise<PromiseSettledResult<R>[]> {
-  const results: PromiseSettledResult<R>[] = [];
-  let next = 0;
-
-  const worker = async (slot: number) => {
-    for (let i = next++; i < items.length; i = next++) {
-      const item = items[i];
-      try {
-        if (item === undefined) throw new Error(`missing item at index ${i}`);
-        results[i] = { status: "fulfilled", value: await fn(item, slot) };
-      } catch (reason) {
-        // Every index gets a slot: a hole here would be silently skipped by
-        // the caller's forEach and the slip would vanish from the tally.
-        results[i] = { status: "rejected", reason };
-      }
-    }
-  };
-
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, (_, slot) => worker(slot)));
-  return results;
 }
 
 /**
