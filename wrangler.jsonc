@@ -18,20 +18,17 @@
     // starting half a list apart so they land in different NIM queues. Add or
     // swap an entry here when a catalog ID changes — no code change needed.
     //
-    // Ordered by measured health, re-tested 2026-08-11 (3 slip parses + one
-    // tool call each, against the live catalog):
-    //   minimax-m3          3/3 correct, 1.5-18s, tool calls OK  <- best
-    //   gpt-oss-120b        2/3 correct, 21-86s,  tool calls OK
-    //   nemotron-3-super    2/3 correct, 21-34s,  tool calls OK
-    //   gemma-4-31b-it      1/6 correct, mostly HTTP 500 — but fails in ~1s,
-    //                       so it costs almost nothing to have it in the list
-    //   glm-5.2             answers, but took 132s once and timed out 8/9;
-    //                       demoted from first place, kept as a late resort
-    //   llama-3.2-90b-vis   0/8, times out every call — last on purpose: a
-    //                       timeout burns ~45s of the 60s retry cap, so this
-    //                       one must never be reached before a working model
+    // Ordered by measured health, re-tested 2026-09-16 (live catalog & slip tests):
+    //   nemotron-3-super    1/1 correct, ~7.2s, clean JSON        <- rank 1 (best)
+    //   gpt-oss-20b         1/1 correct, ~23.5s, clean JSON       <- rank 2 (backup)
+    //   nemotron-3.5-light  ping fast (~1.2s), reasoning output   <- rank 3
+    //   deepseek-v4-flash   stalled queue                         <- rank 4
+    //   gemma-4-31b-it      stalled queue                         <- rank 5
+    //   llama-3.2-90b-vis   stalled queue                         <- rank 6
+    //   llama-3.2-11b-vis   stalled queue                         <- rank 7
     //
-    "NIM_MODELS": "minimaxai/minimax-m3,nvidia/nemotron-3-super-120b-a12b"
+    // Dropped 2026-09-16: minimax-m3 (EOL 2026-09-09), gpt-oss-120b (EOL 2026-09-03), glm-5.2 (EOL 2026-08-21)
+    "NIM_MODELS": "nvidia/nemotron-3-super-120b-a12b,openai/gpt-oss-20b,nvidia/nemotron-3.5-lightning-30b-a3b,deepseek-ai/deepseek-v4-flash-0731,google/gemma-4-31b-it,meta/llama-3.2-90b-vision-instruct,meta/llama-3.2-11b-vision-instruct"
   },
   "d1_databases": [
     {
