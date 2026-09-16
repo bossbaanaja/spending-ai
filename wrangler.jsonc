@@ -18,17 +18,17 @@
     // starting half a list apart so they land in different NIM queues. Add or
     // swap an entry here when a catalog ID changes — no code change needed.
     //
-    // Ordered by measured health, re-tested 2026-09-16 (live catalog & slip tests):
+    // Ordered by measured health, re-tested 2026-09-17 (live catalog & slip tests):
     //   nemotron-3-super    1/1 correct, ~7.2s, clean JSON        <- rank 1 (best)
-    //   gpt-oss-20b         1/1 correct, ~23.5s, clean JSON       <- rank 2 (backup)
-    //   nemotron-3.5-light  ping fast (~1.2s), reasoning output   <- rank 3
-    //   deepseek-v4-flash   stalled queue                         <- rank 4
+    //   deepseek-v4-flash   1/1 correct, ~6.6s, clean JSON        <- rank 2 (fast backup)
+    //   gpt-oss-20b         1/1 correct, ~20.0s, clean JSON       <- rank 3 (reasoning backup)
+    //   nemotron-3.5-light  ping fast (~1.2s), reasoning output   <- rank 4
     //   gemma-4-31b-it      stalled queue                         <- rank 5
     //   llama-3.2-90b-vis   stalled queue                         <- rank 6
     //   llama-3.2-11b-vis   stalled queue                         <- rank 7
     //
     // Dropped 2026-09-16: minimax-m3 (EOL 2026-09-09), gpt-oss-120b (EOL 2026-09-03), glm-5.2 (EOL 2026-08-21)
-    "NIM_MODELS": "nvidia/nemotron-3-super-120b-a12b,openai/gpt-oss-20b,nvidia/nemotron-3.5-lightning-30b-a3b,deepseek-ai/deepseek-v4-flash-0731,google/gemma-4-31b-it,meta/llama-3.2-90b-vision-instruct,meta/llama-3.2-11b-vision-instruct"
+    "NIM_MODELS": "nvidia/nemotron-3-super-120b-a12b,deepseek-ai/deepseek-v4-flash-0731,openai/gpt-oss-20b,nvidia/nemotron-3.5-lightning-30b-a3b,google/gemma-4-31b-it,meta/llama-3.2-90b-vision-instruct,meta/llama-3.2-11b-vision-instruct"
   },
   "d1_databases": [
     {

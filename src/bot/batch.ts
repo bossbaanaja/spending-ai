@@ -59,7 +59,7 @@ const MAX_BATCH_SLIPS = 10;
  * Per-attempt cap for an album slip's NIM call (a lone slip keeps the 45s
  * default — its hedge twin covers a stall).
  */
-const ALBUM_NIM_TIMEOUT_MS = 20_000;
+const ALBUM_NIM_TIMEOUT_MS = 25_000;
 const DEBOUNCE_STEP_MS = 600;
 const MIN_DEBOUNCE_MS = 2_500;
 const DEBOUNCE_MAX_MS = 10_000;
@@ -68,6 +68,10 @@ const DEBOUNCE_MAX_MS = 10_000;
  * lifetime forces termination.
  */
 const PARSE_BUDGET_MS = 55_000;
+/** Concurrency pool size for reading slips within an album. */
+const PARSE_CONCURRENCY = 2;
+/** Cutoff margin: do not start another slip if remaining budget is below this. */
+const CUTOFF_MARGIN_MS = 12_000;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -139,63 +143,74 @@ async function runBatch(api: Api, env: Env, user: UserRow, claimed: SlipBatchRow
     const unreadOverflow = [...overflow];
 
     if (batch.caption) {
+      const caption = batch.caption;
       mayHaveWritten = true;
       const saved: TransactionRow[] = [];
       let duplicates = 0;
       let failed = 0;
+      let completed = 0;
+      let writeLock = Promise.resolve();
 
-      for (let i = 0; i < items.length; i++) {
-        const item = items[i];
-        if (!item) continue;
+      let nextIdx = 0;
+      const workers = Array.from({ length: Math.min(PARSE_CONCURRENCY, items.length) }, async () => {
+        while (true) {
+          const i = nextIdx++;
+          if (i >= items.length) break;
+          const item = items[i];
+          if (!item) continue;
 
-        // Stop if not enough budget left for another slip (download + OCR + NIM takes ~6-8s)
-        if (deadline - Date.now() < 7_000) {
-          console.error(
-            JSON.stringify({ event: "batch_deadline_cutoff", item_id: item.id, remaining_ms: deadline - Date.now() }),
-          );
-          for (let j = i; j < items.length; j++) {
-            const rem = items[j];
-            if (rem) unreadOverflow.push(rem);
+          // Stop if not enough budget left for another slip
+          if (deadline - Date.now() < CUTOFF_MARGIN_MS) {
+            console.error(
+              JSON.stringify({ event: "batch_deadline_cutoff", item_id: item.id, remaining_ms: deadline - Date.now() }),
+            );
+            unreadOverflow.push(item);
+            continue;
           }
-          break;
-        }
 
-        if (items.length > 1) {
-          await editStatus(`🔍 Reading slip ${i + 1} of ${items.length}…`);
-        }
+          try {
+            const image = await downloadPhotoBase64(env.BOT_TOKEN, item.file_id);
+            const slip = await parseSlip(image, caption, env, undefined, {
+              deadline,
+              hedge: false,
+              startIndex: 0,
+              nimTimeoutMs: ALBUM_NIM_TIMEOUT_MS,
+            });
 
-        try {
-          const image = await downloadPhotoBase64(env.BOT_TOKEN, item.file_id);
-          const slip = await parseSlip(image, batch.caption, env, undefined, {
-            deadline,
-            hedge: false,
-            startIndex: 0,
-            nimTimeoutMs: ALBUM_NIM_TIMEOUT_MS,
-          });
-
-          // Progressive save: write row immediately to D1
-          const result = await insertTransaction(db, user.id, slip, batch.caption);
-          if (result === "duplicate") {
-            duplicates += 1;
-            await setItemResult(db, item.id, "duplicate", null, batch.caption);
-          } else {
-            saved.push(result);
-            await setItemResult(db, item.id, "saved", result.id, batch.caption);
-            // Send confirmation card immediately to chat
-            await api
-              .sendMessage(batch.chat_id, formatTxCard(result), { reply_markup: txKeyboard(result) })
-              .catch((err) => {
-                console.error(JSON.stringify({ event: "slip_batch_card_failed", tx: result.id, error: String(err) }));
-              });
+            // Progressive save: write row immediately to D1, serialized
+            await (writeLock = writeLock.then(async () => {
+              const result = await insertTransaction(db, user.id, slip, caption);
+              if (result === "duplicate") {
+                duplicates += 1;
+                await setItemResult(db, item.id, "duplicate", null, caption);
+              } else {
+                saved.push(result);
+                await setItemResult(db, item.id, "saved", result.id, caption);
+                // Send confirmation card immediately to chat
+                await api
+                  .sendMessage(batch.chat_id, formatTxCard(result), { reply_markup: txKeyboard(result) })
+                  .catch((err) => {
+                    console.error(JSON.stringify({ event: "slip_batch_card_failed", tx: result.id, error: String(err) }));
+                  });
+              }
+            }));
+          } catch (err) {
+            failed += 1;
+            await setItemResult(db, item.id, "failed", null, caption);
+            console.error(
+              JSON.stringify({ event: "slip_batch_item_failed", batch: batch.id, item: item.id, error: String(err) }),
+            );
+          } finally {
+            completed += 1;
+            if (items.length > 1 && completed < items.length) {
+              await editStatus(`🔍 Reading slips (${completed}/${items.length} done)…`);
+            }
           }
-        } catch (err) {
-          failed += 1;
-          await setItemResult(db, item.id, "failed", null, batch.caption);
-          console.error(
-            JSON.stringify({ event: "slip_batch_item_failed", batch: batch.id, item: item.id, error: String(err) }),
-          );
         }
-      }
+      });
+
+      await Promise.all(workers);
+      await writeLock;
 
       if (unreadOverflow.length > 0) {
         await setItemsParsed(
@@ -233,55 +248,67 @@ async function runBatch(api: Api, env: Env, user: UserRow, claimed: SlipBatchRow
       return;
     }
 
-    // No caption: read slips sequentially, then ask once.
+    // No caption: read slips concurrently, then ask once.
     const readable: ReadSlip[] = [];
-    const outcomes: { itemId: number; parsedJson: string | null; outcome: BatchItemOutcome }[] = [];
+    const outcomes: { itemId: number; parsedJson: string | null; outcome: BatchItemOutcome; order: number }[] = [];
     let failed = 0;
+    let completed = 0;
 
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      if (!item) continue;
+    let nextIdx = 0;
+    const workers = Array.from({ length: Math.min(PARSE_CONCURRENCY, items.length) }, async () => {
+      while (true) {
+        const i = nextIdx++;
+        if (i >= items.length) break;
+        const item = items[i];
+        if (!item) continue;
 
-      if (deadline - Date.now() < 7_000) {
-        console.error(
-          JSON.stringify({ event: "batch_deadline_cutoff", item_id: item.id, remaining_ms: deadline - Date.now() }),
-        );
-        for (let j = i; j < items.length; j++) {
-          const rem = items[j];
-          if (rem) unreadOverflow.push(rem);
+        if (deadline - Date.now() < CUTOFF_MARGIN_MS) {
+          console.error(
+            JSON.stringify({ event: "batch_deadline_cutoff", item_id: item.id, remaining_ms: deadline - Date.now() }),
+          );
+          unreadOverflow.push(item);
+          continue;
         }
-        break;
-      }
 
-      if (items.length > 1) {
-        await editStatus(`🔍 Reading slip ${i + 1} of ${items.length}…`);
+        try {
+          const image = await downloadPhotoBase64(env.BOT_TOKEN, item.file_id);
+          const slip = await parseSlip(image, "", env, undefined, {
+            deadline,
+            hedge: false,
+            startIndex: 0,
+            nimTimeoutMs: ALBUM_NIM_TIMEOUT_MS,
+          });
+          readable.push({ item, slip, order: i });
+          outcomes.push({ itemId: item.id, parsedJson: JSON.stringify(slip), outcome: "queued", order: i });
+        } catch (err) {
+          failed += 1;
+          outcomes.push({ itemId: item.id, parsedJson: null, outcome: "failed", order: i });
+          console.error(
+            JSON.stringify({ event: "slip_batch_item_failed", batch: batch.id, item: item.id, error: String(err) }),
+          );
+        } finally {
+          completed += 1;
+          if (items.length > 1 && completed < items.length) {
+            await editStatus(`🔍 Reading slips (${completed}/${items.length} done)…`);
+          }
+        }
       }
+    });
 
-      try {
-        const image = await downloadPhotoBase64(env.BOT_TOKEN, item.file_id);
-        const slip = await parseSlip(image, "", env, undefined, {
-          deadline,
-          hedge: false,
-          startIndex: 0,
-          nimTimeoutMs: ALBUM_NIM_TIMEOUT_MS,
-        });
-        readable.push({ item, slip });
-        outcomes.push({ itemId: item.id, parsedJson: JSON.stringify(slip), outcome: "queued" });
-      } catch (err) {
-        failed += 1;
-        outcomes.push({ itemId: item.id, parsedJson: null, outcome: "failed" });
-        console.error(
-          JSON.stringify({ event: "slip_batch_item_failed", batch: batch.id, item: item.id, error: String(err) }),
-        );
-      }
-    }
+    await Promise.all(workers);
 
     for (const ov of unreadOverflow) {
-      outcomes.push({ itemId: ov.id, parsedJson: null, outcome: "skipped" });
+      outcomes.push({ itemId: ov.id, parsedJson: null, outcome: "skipped", order: 999 });
     }
 
+    readable.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+    outcomes.sort((a, b) => a.order - b.order);
+
     if (outcomes.length > 0) {
-      await setItemsParsed(db, outcomes);
+      await setItemsParsed(
+        db,
+        outcomes.map(({ itemId, parsedJson, outcome }) => ({ itemId, parsedJson, outcome })),
+      );
     }
 
     if (readable.length === 0) {
@@ -391,6 +418,7 @@ async function settleAlbum(db: D1Database, batchId: number): Promise<number> {
 interface ReadSlip {
   item: SlipBatchItemRow;
   slip: ParsedSlip;
+  order?: number;
 }
 
 /**
