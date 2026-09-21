@@ -615,17 +615,128 @@ export async function clearActiveBatches(db: D1Database, userId: number): Promis
 
 /** Housekeeping from the daily cron — finished albums are only kept for the note walk. */
 export async function deleteOldBatches(db: D1Database): Promise<number> {
+  const expired = `SELECT b.id FROM slip_batches b LEFT JOIN album_jobs j ON j.batch_id = b.id
+    WHERE b.created_at < datetime('now', '-7 days')
+    AND (j.batch_id IS NULL OR (j.desired_version = j.completed_version AND j.lease_until <= ${Date.now()}))`;
   const res = await db.batch([
-    db.prepare(
-      `DELETE FROM slip_batch_items WHERE batch_id IN
-         (SELECT id FROM slip_batches WHERE created_at < datetime('now', '-7 days'))`,
-    ),
-    db.prepare("DELETE FROM slip_batches WHERE created_at < datetime('now', '-7 days')"),
+    db.prepare(`UPDATE active_questions SET kind = 'none', revision = revision + 1
+      WHERE kind = 'album' AND target_id IN (${expired})`),
+    db.prepare(`DELETE FROM album_receipts WHERE item_id IN (SELECT id FROM slip_batch_items WHERE batch_id IN (${expired}))`),
+    db.prepare(`DELETE FROM album_item_work WHERE item_id IN (SELECT id FROM slip_batch_items WHERE batch_id IN (${expired}))`),
+    db.prepare(`DELETE FROM slip_batch_items WHERE batch_id IN (${expired})`),
+    db.prepare(`DELETE FROM album_jobs WHERE batch_id IN (${expired})`),
+    db.prepare(`DELETE FROM slip_batches WHERE id IN (${expired})`),
   ]);
-  return res[1]?.meta.changes ?? 0;
+  return res[5]?.meta.changes ?? 0;
 }
 
 // ---------- dashboard aggregates ----------
+
+export interface AlbumJob {
+  batch_id: number;
+  desired_version: number;
+  completed_version: number;
+  lease_token: string | null;
+  lease_until: number;
+  next_run_at: number;
+  last_arrival_at: number;
+  accepted_note: string | null;
+  note_mode: 'shared' | 'each' | null;
+  delivery_attempts: number;
+  last_error: string | null;
+}
+
+export interface ActiveQuestion {
+  user_id: number;
+  kind: 'album' | 'single' | 'none';
+  target_id: number | null;
+  generation: number;
+  revision: number;
+}
+
+/** Newer arrivals win; finishing an older parse cannot steal the waiting slot. */
+export async function activateQuestion(db: D1Database, userId: number, kind: ActiveQuestion['kind'], targetId: number | null, generation: number): Promise<void> {
+  await db.prepare(`INSERT INTO active_questions (user_id, kind, target_id, generation) VALUES (?, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET kind = excluded.kind, target_id = excluded.target_id,
+      generation = excluded.generation, revision = active_questions.revision + 1
+    WHERE excluded.generation > active_questions.generation`).bind(userId, kind, targetId, generation).run();
+}
+
+export async function getActiveQuestion(db: D1Database, userId: number): Promise<ActiveQuestion | null> {
+  return db.prepare('SELECT * FROM active_questions WHERE user_id = ?').bind(userId).first<ActiveQuestion>();
+}
+
+/** Compare-and-swap: at most one concurrent answer owns this question revision. */
+export async function consumeQuestion(db: D1Database, question: ActiveQuestion): Promise<boolean> {
+  const result = await db.prepare(`UPDATE active_questions SET kind = 'none', revision = revision + 1
+    WHERE user_id = ? AND kind = ? AND target_id IS ? AND revision = ?`)
+    .bind(question.user_id, question.kind, question.target_id, question.revision).run();
+  return result.meta.changes === 1;
+}
+
+export async function getAlbumJob(db: D1Database, batchId: number): Promise<AlbumJob | null> {
+  return db.prepare('SELECT * FROM album_jobs WHERE batch_id = ?').bind(batchId).first<AlbumJob>();
+}
+
+/** Wakeups are durable in D1; publishing to Queues is only a delivery attempt. */
+export async function wakeAlbum(db: D1Database, batchId: number, now = Date.now()): Promise<void> {
+  await db.prepare(`INSERT INTO album_jobs (batch_id, next_run_at) VALUES (?, ?)
+    ON CONFLICT(batch_id) DO UPDATE SET desired_version = desired_version + 1, next_run_at = excluded.next_run_at,
+      delivery_attempts = 0`).bind(batchId, now).run();
+}
+
+export async function claimAlbumJob(db: D1Database, batchId: number, token: string, now: number, durationMs: number): Promise<AlbumJob | null> {
+  return db.prepare(`UPDATE album_jobs SET lease_token = ?, lease_until = ?
+    WHERE batch_id = ? AND lease_until <= ? AND next_run_at <= ? AND desired_version > completed_version
+    RETURNING *`).bind(token, now + durationMs, batchId, now, now).first<AlbumJob>();
+}
+
+export async function ownsAlbumJob(db: D1Database, batchId: number, token: string, now = Date.now()): Promise<boolean> {
+  return !!(await db.prepare('SELECT batch_id FROM album_jobs WHERE batch_id = ? AND lease_token = ? AND lease_until > ?')
+    .bind(batchId, token, now).first());
+}
+
+/** Only the current owner can acknowledge a version. Later arrivals stay dirty. */
+export async function finishAlbumJob(db: D1Database, job: AlbumJob, token: string, retryAt: number | null): Promise<void> {
+  await db.prepare(`UPDATE album_jobs SET lease_token = NULL, lease_until = 0,
+    completed_version = CASE WHEN ? IS NULL THEN ? ELSE completed_version END,
+    next_run_at = COALESCE(?, next_run_at)
+    WHERE batch_id = ? AND lease_token = ? AND lease_until > ?`)
+    .bind(retryAt, job.desired_version, retryAt, job.batch_id, token, Date.now()).run();
+}
+
+export async function listDueAlbumJobs(db: D1Database, now = Date.now()): Promise<AlbumJob[]> {
+  const rows = await db.prepare(`SELECT * FROM album_jobs WHERE desired_version > completed_version
+    AND lease_until <= ? AND next_run_at <= ? ORDER BY next_run_at LIMIT 50`).bind(now, now).all<AlbumJob>();
+  return rows.results;
+}
+
+/** One atomic transaction creates the expense, records its identity, and marks
+ * the photo saved. NULL bank references and worker replays remain safe. */
+export async function saveAlbumItem(db: D1Database, userId: number, itemId: number, slip: ParsedSlip, note: string | null): Promise<void> {
+  await db.batch([
+    db.prepare(`INSERT INTO transactions
+      (user_id, amount, currency, category, note, receiver, bank, trans_ref, slip_datetime, raw_json, source_item_id)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, b.user_id || ':' || b.media_group_id || ':' || i.message_id
+      FROM slip_batch_items i JOIN slip_batches b ON b.id = i.batch_id
+      WHERE i.id = ? AND b.user_id = ? AND i.outcome = 'queued'
+        AND NOT EXISTS (SELECT 1 FROM album_receipts WHERE item_id = ?)
+      ON CONFLICT DO NOTHING`).bind(userId, slip.amount, slip.currency, slip.category, note, slip.receiver,
+        slip.bank, slip.trans_ref, slip.datetime, JSON.stringify(slip), itemId, userId, itemId),
+    db.prepare(`INSERT INTO album_receipts (item_id, tx_id, outcome)
+      SELECT i.id, CASE WHEN t.source_item_id = b.user_id || ':' || b.media_group_id || ':' || i.message_id THEN t.id ELSE NULL END,
+        CASE WHEN t.source_item_id = b.user_id || ':' || b.media_group_id || ':' || i.message_id THEN 'saved' ELSE 'duplicate' END
+      FROM slip_batch_items i JOIN slip_batches b ON b.id = i.batch_id
+      JOIN transactions t ON t.source_item_id = b.user_id || ':' || b.media_group_id || ':' || i.message_id OR (? IS NOT NULL AND t.trans_ref = ?)
+      WHERE i.id = ? AND b.user_id = ? AND i.outcome = 'queued'
+      ON CONFLICT(item_id) DO NOTHING`).bind(slip.trans_ref, slip.trans_ref, itemId, userId),
+    db.prepare(`UPDATE slip_batch_items SET outcome = (SELECT outcome FROM album_receipts WHERE item_id = ?),
+      tx_id = (SELECT tx_id FROM album_receipts WHERE item_id = ?), note = ?
+      WHERE id = ? AND EXISTS (SELECT 1 FROM album_receipts WHERE item_id = ?)
+      AND batch_id IN (SELECT id FROM slip_batches WHERE user_id = ?)`)
+      .bind(itemId, itemId, note, itemId, itemId, userId),
+  ]);
+}
 
 export interface MonthSummary {
   month: string; // "YYYY-MM"

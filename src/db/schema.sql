@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS transactions (
   trans_ref TEXT UNIQUE,            -- dedup: same slip can't be logged twice
   slip_datetime TEXT,               -- when the transfer actually happened
   raw_json TEXT,                    -- full extraction, for auditing/reprocessing
+  source_item_id TEXT UNIQUE,       -- user:media-group:message identity, independent of OCR
   created_at TEXT DEFAULT (datetime('now')),
   -- Split bookkeeping, all NULL on an ordinary entry. Added after launch, so
   -- existing databases need the matching ALTER TABLE statements (see CLAUDE.md).
@@ -87,3 +88,38 @@ CREATE TABLE IF NOT EXISTS pending_splits (
 );
 CREATE INDEX IF NOT EXISTS idx_pending_splits_user ON pending_splits(user_id);
 
+-- Durable album scheduling. desired_version > completed_version is an outbox
+-- entry: cron republishes it even if a queue send or worker dies.
+CREATE TABLE IF NOT EXISTS album_jobs (
+  batch_id INTEGER PRIMARY KEY REFERENCES slip_batches(id),
+  desired_version INTEGER NOT NULL DEFAULT 1,
+  completed_version INTEGER NOT NULL DEFAULT 0,
+  lease_token TEXT,
+  lease_until INTEGER NOT NULL DEFAULT 0,
+  next_run_at INTEGER NOT NULL DEFAULT 0,
+  last_arrival_at INTEGER NOT NULL DEFAULT 0,
+  accepted_note TEXT,
+  note_mode TEXT CHECK (note_mode IN ('shared', 'each')),
+  delivery_attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT
+);
+CREATE TABLE IF NOT EXISTS album_item_work (
+  item_id INTEGER PRIMARY KEY REFERENCES slip_batch_items(id),
+  ocr_text TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT
+);
+-- A receipt survives deletion of its transaction, so replay cannot resurrect
+-- an expense the user deliberately deleted. Pruned with its album.
+CREATE TABLE IF NOT EXISTS album_receipts (
+  item_id INTEGER PRIMARY KEY REFERENCES slip_batch_items(id),
+  tx_id INTEGER,
+  outcome TEXT NOT NULL CHECK (outcome IN ('saved', 'duplicate'))
+);
+CREATE TABLE IF NOT EXISTS active_questions (
+  user_id INTEGER PRIMARY KEY REFERENCES users(id),
+  kind TEXT NOT NULL CHECK (kind IN ('album', 'single', 'none')),
+  target_id INTEGER,
+  generation INTEGER NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 0
+);
