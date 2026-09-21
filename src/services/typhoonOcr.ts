@@ -41,11 +41,15 @@ export async function typhoonOcrImage(imageBase64: string, env: Env, deadline?: 
   let retryDelay = 300;
   for (let attempt = 0; attempt < 4; attempt++) {
     if (attempt > 0 && Date.now() - started > 40_000) break;
-    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, retryDelay));
+    if (attempt > 0) {
+      if (deadline && Date.now() + retryDelay + 5_000 >= deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, retryDelay));
+    }
     // Clamp the attempt to what the deadline leaves — same rule as nim.ts.
     const attemptTimeout = deadline ? Math.min(30_000, deadline - Date.now() - 2_000) : 30_000;
     if (attemptTimeout < 3_000) break;
     const attemptStarted = Date.now();
+    let providerDelay: number | null = null;
     try {
       const res = await fetch("https://api.opentyphoon.ai/v1/chat/completions", {
         method: "POST",
@@ -75,6 +79,12 @@ export async function typhoonOcrImage(imageBase64: string, env: Env, deadline?: 
         signal: AbortSignal.timeout(attemptTimeout),
       });
       if (!res.ok) {
+        if (res.status === 429) {
+          const value = res.headers.get('retry-after');
+          const seconds = value === null ? NaN : Number(value);
+          const delay = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(value ?? '') - Date.now();
+          if (Number.isFinite(delay) && delay >= 0) providerDelay = delay;
+        }
         throw new Error(`Typhoon OCR API ${res.status}: ${(await res.text()).slice(0, 300)}`);
       }
       const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
@@ -88,7 +98,9 @@ export async function typhoonOcrImage(imageBase64: string, env: Env, deadline?: 
       // rotate to — a 429 (its concurrency cap is ~3 per key, measured
       // 2026-08-26) needs a real pause for an in-flight slip (~8s) to free a
       // slot; 300ms retries all land inside the same busy window.
-      retryDelay = String(err).includes("Typhoon OCR API 429") ? 4_000 : 300;
+      retryDelay = String(err).includes("Typhoon OCR API 429")
+        ? (providerDelay ?? 4_000) + Math.floor(Math.random() * 1000)
+        : 300;
       console.error(JSON.stringify({ event: "typhoon_ocr_attempt_failed", attempt, error: String(err) }));
     }
   }

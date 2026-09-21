@@ -20,7 +20,7 @@ let cachedBot: Bot<BotContext> | null = null;
 export function getBot(env: Env): Bot<BotContext> {
   if (cachedBot) return cachedBot;
 
-  const bot = new Bot<BotContext>(env.BOT_TOKEN);
+  const bot = new Bot<BotContext>(env.BOT_TOKEN, { client: { timeoutSeconds: 8 } });
 
   // Attach env + the registered user (if any) to every update.
   bot.use(async (ctx, next) => {

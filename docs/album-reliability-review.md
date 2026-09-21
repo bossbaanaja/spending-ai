@@ -58,3 +58,38 @@ individual notes and skip advance only one cursor. All 11 tests and typechecking
 
 Verdict: ship — save isolation and question ownership hold across the tested
 handler paths. Automatic background recovery is the next step, not claimed here.
+
+## Step 3 — durable intake and resumable processing
+
+Intent: every received photo has recoverable processing independent of the
+webhook lifetime, including late arrivals and abandoned workers.
+
+Simpler alternative considered: raise the debounce or parse budget. Rejected:
+neither provides a continuation after the invocation dies. One queue consumer
+with two concurrent reads bounds queued-album load without adding Durable Objects.
+
+First pass: fix-then-ship. Moved question selection into the registration
+transaction (a crash between the two writes must not lose the question), fenced
+expense/checkpoint writes against expired owners, and filtered queue-owned jobs
+before applying the recovery scan limit (legacy jobs must not starve recovery).
+
+Trace: `src/index.ts` verifies the webhook secret and registration ->
+`registerQueuedPhoto` atomically stores photo/question/outbox -> queue publish.
+Database failure returns 503 before isolate dedup; publish failure leaves the D1
+outbox for minute cron. `processAlbumJob` claims an expiring lease, processes at
+most two photos, checkpoints OCR and parsed JSON, saves through fenced receipts,
+then renders from stored outcomes. Only its captured version is acknowledged;
+late arrivals stay dirty. Queue ownership persists when rollout is disabled.
+
+Verification: 20 regression tests cover ten slow slips over several deliveries,
+late arrivals during/after reading, duplicate webhooks with missing references,
+failed publishing recovered by cron, failed first status send, expired claims,
+fenced stale writes, cached OCR retries/exhaustion, accepted notes for late photos,
+rollout disable/drain, and 503 followed by successful retry of the same update.
+Typechecking and Wrangler's local deployment dry run pass. Provider retry delays
+remain bounded and Typhoon honours Retry-After without exceeding its deadline.
+
+Verdict: ship — durable delivery and database idempotency hold across the tested
+pipeline. Production resources and canary activation belong to rollout, not this
+commit. Telegram does not provide an idempotent send key: a crash after a successful
+message send but before its ID is stored can duplicate a notification, never an expense.

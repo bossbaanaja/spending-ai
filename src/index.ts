@@ -1,6 +1,9 @@
 import type { Update } from "grammy/types";
 import { getBot } from "./bot/bot";
 import { sendDailyReports } from "./scheduled/dailyReport";
+import { getUserByTelegramId } from './db/repo';
+import { intakeQueuedAlbum, processAlbumJob } from './bot/albumWorker';
+import { recoverAlbumJobs } from './services/albumQueue';
 
 // If Telegram doesn't get a 200 in time (we now hold the response while model
 // calls run), it redelivers the update. Isolate-local dedup is enough: the
@@ -31,6 +34,25 @@ export default {
         update = await request.json<Update>();
       } catch {
         return new Response("bad request", { status: 400 });
+      }
+
+      // Durable album registration precedes isolate-local dedup. A database
+      // failure must return 503 so Telegram can retry, even in this isolate.
+      const message = update.message;
+      if (message?.photo && message.media_group_id && message.from) {
+        try {
+          const user = await getUserByTelegramId(env.DB, message.from.id);
+          const photos = message.photo;
+          const photo = photos[Math.max(0, photos.length - 2)];
+          if (user && photo && await intakeQueuedAlbum(env, user, {
+            chatId: message.chat.id, messageId: message.message_id, mediaGroupId: message.media_group_id,
+            fileId: photo.file_id, caption: message.caption?.trim() || null,
+            generation: message.date * 1_000_000 + message.message_id,
+          })) return new Response('ok');
+        } catch (error) {
+          console.error(JSON.stringify({ event: 'album_intake_failed', error: String(error) }));
+          return new Response('retry', { status: 503 });
+        }
       }
 
       if (seenUpdates.has(update.update_id)) return new Response("ok");
@@ -80,6 +102,25 @@ export default {
   },
 
   async scheduled(controller, env): Promise<void> {
-    await sendDailyReports(env, controller.scheduledTime);
+    if (controller.cron === '0 22 * * *') await sendDailyReports(env, controller.scheduledTime);
+    else await recoverAlbumJobs(env);
+  },
+
+  async queue(batch, env): Promise<void> {
+    for (const message of batch.messages) {
+      const body = message.body;
+      if (!body || typeof body !== 'object' || !('batchId' in body) || typeof body.batchId !== 'number' || !Number.isSafeInteger(body.batchId) || body.batchId <= 0) {
+        console.error(JSON.stringify({ event: 'invalid_album_job' }));
+        message.ack();
+        continue;
+      }
+      try {
+        await processAlbumJob(env, body.batchId);
+        message.ack();
+      } catch (error) {
+        console.error(JSON.stringify({ event: 'album_job_failed', batch: body.batchId, error: String(error) }));
+        message.retry({ delaySeconds: 30 });
+      }
+    }
   },
 } satisfies ExportedHandler<Env>;

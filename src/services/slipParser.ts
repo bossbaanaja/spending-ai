@@ -24,6 +24,8 @@ Rules:
 - Respond with ONLY the JSON object. No explanation, no markdown fences.`;
 
 export interface ParseSlipOptions {
+  cachedOcr?: string;
+  onOcr?: (text: string) => Promise<void>;
   /**
    * Absolute cutoff (epoch ms) for both stages. An album shares one deadline
    * across every slip in it, because they all run inside the leader's single
@@ -70,7 +72,8 @@ export async function parseSlip(
   // leaves the slip handler time to edit the status bubble with the error
   // instead of being cancelled mid-flight with the bubble stuck.
   const { deadline = Date.now() + 65_000, hedge = true, startIndex = 0, nimTimeoutMs } = options;
-  const ocrText = await typhoonOcrImage(imageBase64, env, deadline);
+  const ocrText = options.cachedOcr ?? await typhoonOcrImage(imageBase64, env, deadline);
+  if (!options.cachedOcr) await options.onOcr?.(ocrText);
   timer?.mark("ocr_done");
   console.error(JSON.stringify({ event: "slip_ocr_done", chars: ocrText.length }));
 

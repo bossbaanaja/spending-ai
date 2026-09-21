@@ -1,13 +1,18 @@
 import type { SlipTimer } from "./timing";
 
 /** Downloads a Telegram photo by file_id and returns it base64-encoded for the vision API. */
-export async function downloadPhotoBase64(botToken: string, fileId: string, timer?: SlipTimer): Promise<string> {
+export async function downloadPhotoBase64(botToken: string, fileId: string, timer?: SlipTimer, deadline?: number): Promise<string> {
+  const signal = (limit: number) => {
+    const remaining = deadline === undefined ? limit : Math.min(limit, deadline - Date.now());
+    if (remaining <= 0) throw new Error('photo download deadline reached');
+    return AbortSignal.timeout(remaining);
+  };
   // Downloads finish in well under a second; the timeouts are here because a
   // hung Telegram fetch would otherwise freeze an album's whole parse pool —
   // this is the one external call that had no abort clamp.
   const infoRes = await fetch(
     `https://api.telegram.org/bot${botToken}/getFile?file_id=${encodeURIComponent(fileId)}`,
-    { signal: AbortSignal.timeout(10_000) },
+    { signal: signal(10_000) },
   );
   const info = (await infoRes.json()) as { ok: boolean; result?: { file_path?: string } };
   timer?.mark("telegram_getFile");
@@ -16,7 +21,7 @@ export async function downloadPhotoBase64(botToken: string, fileId: string, time
   }
 
   const fileRes = await fetch(`https://api.telegram.org/file/bot${botToken}/${info.result.file_path}`, {
-    signal: AbortSignal.timeout(15_000),
+    signal: signal(15_000),
   });
   if (!fileRes.ok) {
     throw new Error(`file download failed: HTTP ${fileRes.status}`);

@@ -107,7 +107,11 @@ CREATE TABLE IF NOT EXISTS album_item_work (
   item_id INTEGER PRIMARY KEY REFERENCES slip_batch_items(id),
   ocr_text TEXT,
   attempts INTEGER NOT NULL DEFAULT 0,
+  card_message_id INTEGER,
   last_error TEXT
+);
+CREATE TABLE IF NOT EXISTS album_queue_batches (
+  batch_id INTEGER PRIMARY KEY REFERENCES slip_batches(id)
 );
 -- A receipt survives deletion of its transaction, so replay cannot resurrect
 -- an expense the user deliberately deleted. Pruned with its album.

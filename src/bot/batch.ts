@@ -30,6 +30,7 @@ import {
   finishAlbumJob,
   wakeAlbum,
   commitWalkAnswer,
+  isQueuedAlbum,
   saveAlbumItem,
   claimBatch,
   clearActiveBatches,
@@ -52,6 +53,7 @@ import {
   updateNote,
 } from "../db/repo";
 import { parseSlip } from "../services/slipParser";
+import { publishAlbum } from '../services/albumQueue';
 import { downloadPhotoBase64 } from "../services/telegramFile";
 import type {
   BatchItemOutcome,
@@ -556,6 +558,11 @@ export async function completeBatchWithNote(
   if (!accepted && previous?.note_mode !== 'shared') return;
   note = previous?.accepted_note ?? note;
   await wakeAlbum(db, batch.id);
+  if (await isQueuedAlbum(db, batch.id)) {
+    await clearAlbumQuestion(db, user.id, batch.id);
+    await publishAlbum(env, batch.id, 0);
+    return;
+  }
   const token = crypto.randomUUID();
   const job = await claimAlbumJob(db, batch.id, token, Date.now(), 70_000);
   if (!job) return;

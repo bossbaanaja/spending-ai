@@ -630,10 +630,11 @@ export async function deleteOldBatches(db: D1Database): Promise<number> {
     db.prepare(`DELETE FROM album_receipts WHERE item_id IN (SELECT id FROM slip_batch_items WHERE batch_id IN (${expired}))`),
     db.prepare(`DELETE FROM album_item_work WHERE item_id IN (SELECT id FROM slip_batch_items WHERE batch_id IN (${expired}))`),
     db.prepare(`DELETE FROM slip_batch_items WHERE batch_id IN (${expired})`),
+    db.prepare(`DELETE FROM album_queue_batches WHERE batch_id IN (${expired})`),
     db.prepare(`DELETE FROM album_jobs WHERE batch_id IN (${expired})`),
     db.prepare(`DELETE FROM slip_batches WHERE id IN (${expired})`),
   ]);
-  return res[5]?.meta.changes ?? 0;
+  return res[6]?.meta.changes ?? 0;
 }
 
 // ---------- dashboard aggregates ----------
@@ -712,9 +713,11 @@ export async function acceptAlbumNote(db: D1Database, userId: number, batchId: n
 }
 
 /** Clear only this album's question. Never expose an older waiting album. */
-export async function clearAlbumQuestion(db: D1Database, userId: number, batchId: number): Promise<void> {
+export async function clearAlbumQuestion(db: D1Database, userId: number, batchId: number, lease: string | null = null): Promise<void> {
   await db.prepare(`UPDATE active_questions SET kind = 'none', revision = revision + 1
-    WHERE user_id = ? AND kind = 'album' AND target_id = ?`).bind(userId, batchId).run();
+    WHERE user_id = ? AND kind = 'album' AND target_id = ? AND (? IS NULL OR EXISTS
+    (SELECT 1 FROM album_jobs WHERE batch_id = ? AND lease_token = ? AND lease_until > ?))`)
+    .bind(userId, batchId, lease, batchId, lease, Date.now()).run();
 }
 
 /** Explicit resume may select an older album without weakening arrival ordering. */
@@ -789,15 +792,20 @@ export async function finishAlbumJob(db: D1Database, job: AlbumJob, token: strin
     .bind(retryAt, job.desired_version, retryAt, job.batch_id, token, Date.now()).run();
 }
 
-export async function listDueAlbumJobs(db: D1Database, now = Date.now()): Promise<AlbumJob[]> {
+export async function listDueAlbumJobs(db: D1Database, now = Date.now(), queuedOnly = false): Promise<AlbumJob[]> {
   const rows = await db.prepare(`SELECT * FROM album_jobs WHERE desired_version > completed_version
-    AND lease_until <= ? AND next_run_at <= ? ORDER BY next_run_at LIMIT 50`).bind(now, now).all<AlbumJob>();
+    AND lease_until <= ? AND next_run_at <= ?
+    ${queuedOnly ? 'AND batch_id IN (SELECT batch_id FROM album_queue_batches)' : ''}
+    ORDER BY next_run_at LIMIT 50`).bind(now, now).all<AlbumJob>();
   return rows.results;
 }
 
 /** One atomic transaction creates the expense, records its identity, and marks
  * the photo saved. NULL bank references and worker replays remain safe. */
-export async function saveAlbumItem(db: D1Database, userId: number, itemId: number, slip: ParsedSlip, note: string | null): Promise<void> {
+export async function saveAlbumItem(db: D1Database, userId: number, itemId: number, slip: ParsedSlip, note: string | null, lease: string | null = null): Promise<void> {
+  const fence = `(? IS NULL OR EXISTS (SELECT 1 FROM album_jobs j JOIN slip_batch_items x ON x.batch_id = j.batch_id
+    WHERE x.id = ? AND j.lease_token = ? AND j.lease_until > ?))`;
+  const fenceArgs = [lease, itemId, lease, Date.now()];
   await db.batch([
     db.prepare(`INSERT INTO transactions
       (user_id, amount, currency, category, note, receiver, bank, trans_ref, slip_datetime, raw_json, source_item_id)
@@ -805,21 +813,119 @@ export async function saveAlbumItem(db: D1Database, userId: number, itemId: numb
       FROM slip_batch_items i JOIN slip_batches b ON b.id = i.batch_id
       WHERE i.id = ? AND b.user_id = ? AND i.outcome = 'queued'
         AND NOT EXISTS (SELECT 1 FROM album_receipts WHERE item_id = ?)
+        AND ${fence}
       ON CONFLICT DO NOTHING`).bind(userId, slip.amount, slip.currency, slip.category, note, slip.receiver,
-        slip.bank, slip.trans_ref, slip.datetime, JSON.stringify(slip), itemId, userId, itemId),
+        slip.bank, slip.trans_ref, slip.datetime, JSON.stringify(slip), itemId, userId, itemId, ...fenceArgs),
     db.prepare(`INSERT INTO album_receipts (item_id, tx_id, outcome)
       SELECT i.id, CASE WHEN t.source_item_id = b.user_id || ':' || b.media_group_id || ':' || i.message_id THEN t.id ELSE NULL END,
         CASE WHEN t.source_item_id = b.user_id || ':' || b.media_group_id || ':' || i.message_id THEN 'saved' ELSE 'duplicate' END
       FROM slip_batch_items i JOIN slip_batches b ON b.id = i.batch_id
       JOIN transactions t ON t.source_item_id = b.user_id || ':' || b.media_group_id || ':' || i.message_id OR (? IS NOT NULL AND t.trans_ref = ?)
       WHERE i.id = ? AND b.user_id = ? AND i.outcome = 'queued'
-      ON CONFLICT(item_id) DO NOTHING`).bind(slip.trans_ref, slip.trans_ref, itemId, userId),
+        AND ${fence}
+      ON CONFLICT(item_id) DO NOTHING`).bind(slip.trans_ref, slip.trans_ref, itemId, userId, ...fenceArgs),
     db.prepare(`UPDATE slip_batch_items SET outcome = (SELECT outcome FROM album_receipts WHERE item_id = ?),
       tx_id = (SELECT tx_id FROM album_receipts WHERE item_id = ?), note = ?
       WHERE id = ? AND EXISTS (SELECT 1 FROM album_receipts WHERE item_id = ?)
-      AND batch_id IN (SELECT id FROM slip_batches WHERE user_id = ?)`)
-      .bind(itemId, itemId, note, itemId, itemId, userId),
+      AND batch_id IN (SELECT id FROM slip_batches WHERE user_id = ?) AND ${fence}`)
+      .bind(itemId, itemId, note, itemId, itemId, userId, ...fenceArgs),
   ]);
+}
+
+export interface AlbumItemWork { item_id: number; ocr_text: string | null; attempts: number; card_message_id: number | null; last_error: string | null }
+
+export async function isQueuedAlbum(db: D1Database, batchId: number): Promise<boolean> {
+  return !!await db.prepare('SELECT batch_id FROM album_queue_batches WHERE batch_id = ?').bind(batchId).first();
+}
+
+/** Photo registration and its durable wakeup commit together, before HTTP 200. */
+export async function registerQueuedPhoto(db: D1Database, userId: number, photo: {
+  mediaGroupId: string; chatId: number; messageId: number; fileId: string; caption: string | null; generation?: number;
+}, now = Date.now()): Promise<SlipBatchRow> {
+  await db.batch([
+    db.prepare(`INSERT INTO slip_batches (user_id, media_group_id, chat_id, caption) VALUES (?, ?, ?, ?)
+      ON CONFLICT(user_id, media_group_id) DO NOTHING`).bind(userId, photo.mediaGroupId, photo.chatId, photo.caption),
+    db.prepare(`INSERT INTO slip_batch_items (batch_id, message_id, file_id)
+      SELECT id, ?, ? FROM slip_batches WHERE user_id = ? AND media_group_id = ?
+      ON CONFLICT(batch_id, message_id) DO NOTHING`).bind(photo.messageId, photo.fileId, userId, photo.mediaGroupId),
+    db.prepare(`INSERT INTO album_jobs (batch_id, last_arrival_at, next_run_at)
+      SELECT id, ?, ? FROM slip_batches WHERE user_id = ? AND media_group_id = ? AND changes() = 1
+      ON CONFLICT(batch_id) DO UPDATE SET desired_version = desired_version + 1,
+        last_arrival_at = excluded.last_arrival_at, next_run_at = excluded.next_run_at, delivery_attempts = 0`)
+      .bind(now, now + 3000, userId, photo.mediaGroupId),
+    db.prepare(`INSERT INTO album_queue_batches (batch_id)
+      SELECT id FROM slip_batches WHERE user_id = ? AND media_group_id = ? ON CONFLICT DO NOTHING`).bind(userId, photo.mediaGroupId),
+    db.prepare(`INSERT INTO active_questions (user_id, kind, target_id, generation)
+      SELECT user_id, ?, id, ? FROM slip_batches WHERE user_id = ? AND media_group_id = ? AND changes() = 1
+      ON CONFLICT(user_id) DO UPDATE SET kind = excluded.kind, target_id = excluded.target_id,
+        generation = excluded.generation, revision = revision + 1
+      WHERE excluded.generation > active_questions.generation`)
+      .bind(photo.caption ? 'none' : 'album', photo.generation ?? now, userId, photo.mediaGroupId),
+    db.prepare(`INSERT INTO album_item_work (item_id) SELECT i.id FROM slip_batch_items i JOIN slip_batches b ON b.id = i.batch_id
+      WHERE b.user_id = ? AND b.media_group_id = ? ON CONFLICT DO NOTHING`).bind(userId, photo.mediaGroupId),
+    db.prepare(`INSERT INTO album_jobs (batch_id) SELECT id FROM slip_batches
+      WHERE user_id = ? AND media_group_id = ? ON CONFLICT DO NOTHING`).bind(userId, photo.mediaGroupId),
+    db.prepare('UPDATE slip_batches SET caption = COALESCE(caption, ?) WHERE user_id = ? AND media_group_id = ?')
+      .bind(photo.caption, userId, photo.mediaGroupId),
+    // A late insertion can shift send-order indices. Retire the old prompt
+    // before its next reply can be attached to a different expense.
+    db.prepare(`UPDATE slip_batches SET state = 'awaiting_note', ask_index = 0
+      WHERE user_id = ? AND media_group_id = ? AND state = 'asking' AND EXISTS
+      (SELECT 1 FROM slip_batch_items WHERE batch_id = slip_batches.id AND message_id = ?
+        AND parsed_json IS NULL AND outcome = 'queued')`).bind(userId, photo.mediaGroupId, photo.messageId),
+    db.prepare(`UPDATE active_questions SET kind = 'none', revision = revision + 1
+      WHERE user_id = ? AND kind = 'album' AND changes() = 1 AND target_id IN
+        (SELECT id FROM slip_batches WHERE user_id = ? AND media_group_id = ?)`)
+      .bind(userId, userId, photo.mediaGroupId),
+    db.prepare('DELETE FROM pending_splits WHERE user_id = ?').bind(userId),
+  ]);
+  const batch = await getBatchByGroup(db, userId, photo.mediaGroupId);
+  if (!batch) throw new Error('album registration returned no batch');
+  return batch;
+}
+
+export async function setOwnedAlbumState(db: D1Database, batchId: number, token: string, state: BatchState): Promise<void> {
+  await db.prepare(`UPDATE slip_batches SET state = ? WHERE id = ? AND EXISTS
+    (SELECT 1 FROM album_jobs WHERE batch_id = ? AND lease_token = ? AND lease_until > ?)`)
+    .bind(state, batchId, batchId, token, Date.now()).run();
+}
+
+export async function getAlbumOwner(db: D1Database, batchId: number): Promise<UserRow | null> {
+  return db.prepare('SELECT u.* FROM users u JOIN slip_batches b ON b.user_id = u.id WHERE b.id = ?').bind(batchId).first<UserRow>();
+}
+
+export async function getAlbumItemWork(db: D1Database, itemId: number): Promise<AlbumItemWork | null> {
+  return db.prepare('SELECT * FROM album_item_work WHERE item_id = ?').bind(itemId).first<AlbumItemWork>();
+}
+
+export async function beginAlbumItemAttempt(db: D1Database, itemId: number, token: string): Promise<AlbumItemWork | null> {
+  return db.prepare(`UPDATE album_item_work SET attempts = attempts + 1 WHERE item_id = ? AND EXISTS
+    (SELECT 1 FROM album_jobs j JOIN slip_batch_items i ON i.batch_id = j.batch_id
+    WHERE i.id = ? AND j.lease_token = ? AND j.lease_until > ?) RETURNING *`)
+    .bind(itemId, itemId, token, Date.now()).first<AlbumItemWork>();
+}
+
+export async function checkpointAlbumItem(db: D1Database, itemId: number, token: string,
+  value: { ocr?: string; parsed?: string; outcome?: BatchItemOutcome; error?: string }): Promise<void> {
+  const guard = `EXISTS (SELECT 1 FROM album_jobs j JOIN slip_batch_items i ON i.batch_id = j.batch_id
+    WHERE i.id = ? AND j.lease_token = ? AND j.lease_until > ?)`;
+  const bindings = [itemId, token, Date.now()];
+  await db.batch([
+    db.prepare(`UPDATE album_item_work SET ocr_text = COALESCE(?, ocr_text), last_error = ? WHERE item_id = ? AND ${guard}`)
+      .bind(value.ocr ?? null, value.error ?? null, itemId, ...bindings),
+    db.prepare(`UPDATE slip_batch_items SET parsed_json = COALESCE(?, parsed_json), outcome = COALESCE(?, outcome)
+      WHERE id = ? AND outcome = 'queued' AND ${guard}`).bind(value.parsed ?? null, value.outcome ?? null, itemId, ...bindings),
+  ]);
+}
+
+export async function markAlbumCard(db: D1Database, itemId: number, messageId: number): Promise<void> {
+  await db.prepare('UPDATE album_item_work SET card_message_id = ? WHERE item_id = ?').bind(messageId, itemId).run();
+}
+
+export async function recordAlbumDeliveryFailure(db: D1Database, batchId: number, token: string, error: string): Promise<number> {
+  const row = await db.prepare(`UPDATE album_jobs SET delivery_attempts = delivery_attempts + 1, last_error = ?
+    WHERE batch_id = ? AND lease_token = ? RETURNING delivery_attempts`).bind(error.slice(0, 500), batchId, token).first<{ delivery_attempts: number }>();
+  return row?.delivery_attempts ?? 0;
 }
 
 export interface MonthSummary {
