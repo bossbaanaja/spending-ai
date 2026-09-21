@@ -29,7 +29,9 @@ export function txKeyboard(tx: TransactionRow): InlineKeyboard {
  * is more than one slip to walk.
  */
 export function batchNoteKeyboard(batchId: number): InlineKeyboard {
-  return new InlineKeyboard().text("📝 Different note for each", `bnote:each:${batchId}`);
+  return new InlineKeyboard()
+    .text("📝 Different note for each", `bnote:each:${batchId}`)
+    .row().text("Resume this album", `bnote:resume:${batchId}`);
 }
 
 /** Shown under each "slip n of N — what was this for?" question. */

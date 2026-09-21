@@ -16,6 +16,21 @@
 import type { Api, InlineKeyboard } from "grammy";
 import {
   addBatchItem,
+  activateQuestion,
+  acceptAlbumNote,
+  chooseIndividualNotes,
+  clearAlbumQuestion,
+  getAlbumJob,
+  getActiveQuestion,
+  consumeQuestion,
+  resumeAlbumQuestion,
+  restoreAlbumQuestion,
+  rememberAlbumCaption,
+  claimAlbumJob,
+  finishAlbumJob,
+  wakeAlbum,
+  commitWalkAnswer,
+  saveAlbumItem,
   claimBatch,
   clearActiveBatches,
   countBatchItems,
@@ -76,6 +91,7 @@ const CUTOFF_MARGIN_MS = 12_000;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export interface AlbumPhoto {
+  generation?: number;
   chatId: number;
   messageId: number;
   mediaGroupId: string;
@@ -93,6 +109,8 @@ export async function handleAlbumPhoto(api: Api, env: Env, user: UserRow, photo:
   const claimed = await claimBatch(db, user.id, photo.mediaGroupId, photo.chatId, photo.caption);
   const batch = claimed ?? (await getBatchByGroup(db, user.id, photo.mediaGroupId));
   if (!batch) throw new Error(`album ${photo.mediaGroupId}: lost the claim but found no batch row`);
+
+  if (claimed) await activateQuestion(db, user.id, photo.caption ? 'none' : 'album', batch.id, photo.generation ?? Date.now());
 
   await addBatchItem(db, batch.id, photo.messageId, photo.fileId);
   // Telegram attaches the caption to one photo of the album, which is not
@@ -144,6 +162,7 @@ async function runBatch(api: Api, env: Env, user: UserRow, claimed: SlipBatchRow
 
     if (batch.caption) {
       const caption = batch.caption;
+      await rememberAlbumCaption(db, batch.id, caption);
       mayHaveWritten = true;
       const saved: TransactionRow[] = [];
       let duplicates = 0;
@@ -178,14 +197,16 @@ async function runBatch(api: Api, env: Env, user: UserRow, claimed: SlipBatchRow
             });
 
             // Progressive save: write row immediately to D1, serialized
-            await (writeLock = writeLock.then(async () => {
-              const result = await insertTransaction(db, user.id, slip, caption);
-              if (result === "duplicate") {
+            await setItemsParsed(db, [{ itemId: item.id, parsedJson: JSON.stringify(slip), outcome: 'queued' }]);
+            const write = writeLock.then(async () => {
+              await saveAlbumItem(db, user.id, item.id, slip, caption);
+              const persisted = (await listBatchItems(db, batch.id)).find(row => row.id === item.id);
+              if (persisted?.outcome === 'duplicate') {
                 duplicates += 1;
-                await setItemResult(db, item.id, "duplicate", null, caption);
               } else {
+                const result = persisted?.tx_id ? await getTransaction(db, persisted.tx_id, user.id) : null;
+                if (!result) throw new Error('album save did not produce an expense');
                 saved.push(result);
-                await setItemResult(db, item.id, "saved", result.id, caption);
                 // Send confirmation card immediately to chat
                 await api
                   .sendMessage(batch.chat_id, formatTxCard(result), { reply_markup: txKeyboard(result) })
@@ -193,10 +214,14 @@ async function runBatch(api: Api, env: Env, user: UserRow, claimed: SlipBatchRow
                     console.error(JSON.stringify({ event: "slip_batch_card_failed", tx: result.id, error: String(err) }));
                   });
               }
-            }));
+            });
+            writeLock = write.catch(() => {});
+            await write;
           } catch (err) {
             failed += 1;
-            await setItemResult(db, item.id, "failed", null, caption);
+            // A parsed slip with a failed save stays queued for a retry.
+            const persisted = (await listBatchItems(db, batch.id)).find(row => row.id === item.id);
+            if (!persisted?.parsed_json) await setItemResult(db, item.id, "failed", null, caption);
             console.error(
               JSON.stringify({ event: "slip_batch_item_failed", batch: batch.id, item: item.id, error: String(err) }),
             );
@@ -219,7 +244,8 @@ async function runBatch(api: Api, env: Env, user: UserRow, claimed: SlipBatchRow
         );
       }
 
-      await setBatchState(db, batch.id, "done");
+      const needsSave = (await listBatchItems(db, batch.id)).some(item => item.outcome === 'queued' && item.parsed_json);
+      await setBatchState(db, batch.id, needsSave ? 'awaiting_note' : 'done');
       const late = unreadOverflow.length + (await countUnreadItems(db, batch.id));
 
       if (saved.length === 0 && duplicates === 0) {
@@ -233,7 +259,7 @@ async function runBatch(api: Api, env: Env, user: UserRow, claimed: SlipBatchRow
             : `✅ Logged ${saved.length} slip${saved.length === 1 ? "" : "s"}`;
         await editStatus(
           formatBatchSummary({ saved, duplicates, failed, skipped: late }, heading),
-          saved.length > 1 ? batchNoteKeyboard(batch.id) : undefined,
+          saved.length > 1 || needsSave ? batchNoteKeyboard(batch.id) : undefined,
         );
       }
 
@@ -279,6 +305,7 @@ async function runBatch(api: Api, env: Env, user: UserRow, claimed: SlipBatchRow
             nimTimeoutMs: ALBUM_NIM_TIMEOUT_MS,
           });
           readable.push({ item, slip, order: i });
+          await setItemsParsed(db, [{ itemId: item.id, parsedJson: JSON.stringify(slip), outcome: 'queued' }]);
           outcomes.push({ itemId: item.id, parsedJson: JSON.stringify(slip), outcome: "queued", order: i });
         } catch (err) {
           failed += 1;
@@ -328,12 +355,11 @@ async function runBatch(api: Api, env: Env, user: UserRow, claimed: SlipBatchRow
     }
 
     await setBatchState(db, batch.id, "awaiting_note");
-    await deletePending(db, user.id);
     const slips = readable.map((entry) => entry.slip);
     const late = unreadOverflow.length + (await countUnreadItems(db, batch.id));
     await editStatus(
       askNoteText(slips, { failed, skipped: late }),
-      slips.length > 1 ? batchNoteKeyboard(batch.id) : undefined,
+      batchNoteKeyboard(batch.id),
     );
     logBatch(batch, {
       slips: items.length,
@@ -431,21 +457,26 @@ async function saveAll(
   userId: number,
   readable: ReadSlip[],
   note: string | null,
-): Promise<{ saved: TransactionRow[]; duplicates: number }> {
+): Promise<{ saved: TransactionRow[]; duplicates: number; saveFailures: number }> {
   const saved: TransactionRow[] = [];
   let duplicates = 0;
+  let saveFailures = 0;
 
   for (const { item, slip } of readable) {
-    const result = await insertTransaction(db, userId, slip, note);
-    if (result === "duplicate") {
-      duplicates += 1;
-      await setItemResult(db, item.id, "duplicate", null, note);
-    } else {
-      saved.push(result);
-      await setItemResult(db, item.id, "saved", result.id, note);
+    try {
+      await saveAlbumItem(db, userId, item.id, slip, note);
+      const persisted = (await listBatchItems(db, item.batch_id)).find(row => row.id === item.id);
+      if (persisted?.outcome === 'duplicate') duplicates += 1;
+      else if (persisted?.tx_id) {
+        const tx = await getTransaction(db, persisted.tx_id, userId);
+        if (tx) saved.push(tx);
+      } else throw new Error('album save did not finish');
+    } catch (error) {
+      saveFailures++;
+      console.error(JSON.stringify({ event: 'album_save_retry_needed', item: item.id, error: String(error) }));
     }
   }
-  return { saved, duplicates };
+  return { saved, duplicates, saveFailures };
 }
 
 interface BatchTally {
@@ -519,17 +550,29 @@ export async function completeBatchWithNote(
   note: string,
 ): Promise<void> {
   const db = env.DB;
-  const { readable, failed, skipped } = await pendingItems(db, batch.id);
-  await setBatchState(db, batch.id, "done");
-
-  if (readable.length === 0) {
-    await api.sendMessage(batch.chat_id, "Those slips are no longer waiting — send them again.");
-    return;
-  }
-
+  // First accepted note is durable. A retry finishes with that same note.
+  const accepted = await acceptAlbumNote(db, user.id, batch.id, note);
+  const previous = await getAlbumJob(db, batch.id);
+  if (!accepted && previous?.note_mode !== 'shared') return;
+  note = previous?.accepted_note ?? note;
+  await wakeAlbum(db, batch.id);
+  const token = crypto.randomUUID();
+  const job = await claimAlbumJob(db, batch.id, token, Date.now(), 70_000);
+  if (!job) return;
+  let retryAt: number | null = Date.now() + 30_000;
   try {
-    const { saved, duplicates } = await saveAll(db, user.id, readable, note);
-    await renderResult(api, batch, statusEditor(api, batch), { saved, duplicates, failed, skipped });
+    const { readable } = await pendingItems(db, batch.id);
+    const { saveFailures } = await saveAll(db, user.id, readable, note);
+    const tally = await batchTally(db, batch, user.id);
+    if (saveFailures) {
+      await setBatchState(db, batch.id, 'awaiting_note');
+      await statusEditor(api, batch)(`${tally.saved.length} slips saved. ${saveFailures} still need saving. Tap Resume to retry.`, batchNoteKeyboard(batch.id));
+      return;
+    }
+    await setBatchState(db, batch.id, 'done');
+    await clearAlbumQuestion(db, user.id, batch.id);
+    await renderResult(api, batch, statusEditor(api, batch), tally);
+    retryAt = null;
   } catch (err) {
     // The early "done" above is what makes a second quick reply harmless, but
     // on a failed save it would strand the batch: the user is told to retry
@@ -538,7 +581,23 @@ export async function completeBatchWithNote(
     // "already logged" instead of double entries.
     await setBatchState(db, batch.id, "awaiting_note").catch(() => {});
     throw err;
+  } finally {
+    await finishAlbumJob(db, job, token, retryAt);
   }
+}
+
+export async function batchTally(db: D1Database, batch: SlipBatchRow, userId: number): Promise<BatchTally> {
+  const items = await listBatchItems(db, batch.id);
+  const saved: TransactionRow[] = [];
+  for (const item of items) {
+    if (item.outcome === 'saved' && item.tx_id) {
+      const tx = await getTransaction(db, item.tx_id, userId);
+      if (tx) saved.push(tx);
+    }
+  }
+  return { saved, duplicates: items.filter(i => i.outcome === 'duplicate').length,
+    failed: items.filter(i => i.outcome === 'failed').length,
+    skipped: items.filter(i => i.outcome === 'skipped').length };
 }
 
 /**
@@ -583,6 +642,14 @@ async function pendingItems(
  */
 export async function startNoteWalk(api: Api, env: Env, user: UserRow, batch: SlipBatchRow): Promise<void> {
   const db = env.DB;
+  await wakeAlbum(db, batch.id);
+  const token = crypto.randomUUID();
+  const job = await claimAlbumJob(db, batch.id, token, Date.now(), 70_000);
+  if (!job) return;
+  let retryAt: number | null = Date.now() + 30_000;
+  try {
+    if (!await chooseIndividualNotes(db, user.id, batch.id)) return;
+    await resumeAlbumQuestion(db, user.id, batch.id);
 
   // The walk claims the one waiting slot. Without this, a single slip still
   // waiting for its note would have its answer swallowed by the walk's first
@@ -591,12 +658,8 @@ export async function startNoteWalk(api: Api, env: Env, user: UserRow, batch: Sl
 
   if (batch.state === "awaiting_note") {
     const { readable, failed, skipped } = await pendingItems(db, batch.id);
-    if (readable.length === 0) {
-      await setBatchState(db, batch.id, "done");
-      await api.sendMessage(batch.chat_id, "Those slips are no longer waiting — send them again.");
-      return;
-    }
-    const { saved, duplicates } = await saveAll(db, user.id, readable, null);
+    const { saved, duplicates, saveFailures } = await saveAll(db, user.id, readable, null);
+    if (saveFailures) throw new Error('some slips still need saving');
     // offerNotes = false: the walk is starting right now, so re-attaching the
     // button that started it would just let it be started twice.
     await renderResult(api, batch, statusEditor(api, batch), { saved, duplicates, failed, skipped }, false);
@@ -606,6 +669,10 @@ export async function startNoteWalk(api: Api, env: Env, user: UserRow, batch: Sl
   await setBatchAskIndex(db, batch.id, 0);
   await setBatchAskMessage(db, batch.id, null);
   await askNext(api, env, user, { ...batch, state: "asking", ask_index: 0, ask_message_id: null }, null);
+    retryAt = null;
+  } finally {
+    await finishAlbumJob(db, job, token, retryAt);
+  }
 }
 
 /** Edits the batch's status bubble, or sends a fresh message if it's gone. */
@@ -627,16 +694,8 @@ export async function answerAskNote(
   note: string,
 ): Promise<void> {
   const db = env.DB;
-  const saved = (await listBatchItems(db, batch.id)).filter((item) => item.outcome === "saved" && item.tx_id);
-  const item = saved[batch.ask_index];
-
-  if (!item?.tx_id) {
-    await finishNoteWalk(api, env, batch, "✅ All done — notes updated.");
-    return;
-  }
-  await updateNote(db, item.tx_id, user.id, note);
-  await setItemNote(db, item.id, note);
-  await advanceNoteWalk(api, env, user, batch, `Saved as "${note}".`);
+  if (!await commitWalkAnswer(db, user.id, batch.id, batch.ask_index, note)) return;
+  await askNext(api, env, user, { ...batch, ask_index: batch.ask_index + 1 }, `Saved as "${note}".`);
 }
 
 /** ⏭ Skip / the answer landed — move the cursor on and ask the next one. */
@@ -648,7 +707,7 @@ export async function advanceNoteWalk(
   confirmation: string | null,
 ): Promise<void> {
   const nextIndex = batch.ask_index + 1;
-  await setBatchAskIndex(env.DB, batch.id, nextIndex);
+  if (!await commitWalkAnswer(env.DB, user.id, batch.id, batch.ask_index, null)) return;
   await askNext(api, env, user, { ...batch, ask_index: nextIndex }, confirmation);
 }
 
@@ -703,6 +762,7 @@ async function askNext(
 /** ✅ Stop asking, or the walk ran out of slips. */
 export async function finishNoteWalk(api: Api, env: Env, batch: SlipBatchRow, text: string): Promise<void> {
   await setBatchState(env.DB, batch.id, "done");
+  await clearAlbumQuestion(env.DB, batch.user_id, batch.id);
   if (batch.ask_message_id) {
     await api.editMessageText(batch.chat_id, batch.ask_message_id, text);
   } else {

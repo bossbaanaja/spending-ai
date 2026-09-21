@@ -28,3 +28,33 @@ unfinished work and cannot collide with a subsequently reused numeric item ID.
 
 Verdict: ship — seven deterministic SQLite tests and TypeScript checking pass;
 the database safeguards are additive and existing handler behavior is unchanged.
+
+## Step 2 — independent saves and explicit questions
+
+Intent: a failed expense save must not stop its neighbours, and only the current
+question may consume a reply.
+
+Simpler alternative considered: clear all old albums when a new one finishes.
+Rejected: finishing order differs from arrival order and would discard recoverable
+unnoted slips. The explicit pointer preserves older albums behind Resume.
+
+First pass: fix-then-ship. Releasing the shared save promise was insufficient:
+simultaneous notes could still run completion together. Added a processing claim,
+persisted the first accepted note, and made per-slip note/skip cursor changes
+transactional. Single-slip arrival also clears an obsolete pending record in the
+same transaction so a reply during its OCR cannot save the previous photo.
+
+Trace: `handleAlbumPhoto` / `registerSlip` -> `activateQuestion`; plain text ->
+`getActiveBatch` -> `completeBatchWithNote` -> accepted note / claim -> independent
+`saveAlbumItem` operations -> explicit question clear. `startNoteWalk`, answer,
+skip and Resume use the same user-scoped records. Retries read saved counts back
+from D1 and cannot resurrect older questions.
+
+Verification: handler replay with the first captioned save failing still saves
+the other two, then Resume saves the remaining photo. Two simultaneous notes for
+a NULL-reference photo produce one expense with the first note. Completing the
+newer album leaves no active older album; Resume restores it explicitly. Competing
+individual notes and skip advance only one cursor. All 11 tests and typechecking pass.
+
+Verdict: ship — save isolation and question ownership hold across the tested
+handler paths. Automatic background recovery is the next step, not claimed here.

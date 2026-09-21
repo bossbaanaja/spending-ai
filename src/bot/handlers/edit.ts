@@ -11,10 +11,10 @@ import {
   undoSplit,
   updateCategory,
 } from "../../db/repo";
-import { getBatch, isBatchAnswerable } from "../../db/repo";
+import { getBatch, getAlbumJob, isBatchAnswerable, resumeAlbumQuestion } from "../../db/repo";
 import { isSplitCount } from "../../split";
 import { asCategory } from "../../types";
-import { advanceNoteWalk, finishNoteWalk, startNoteWalk } from "../batch";
+import { advanceNoteWalk, completeBatchWithNote, finishNoteWalk, startNoteWalk } from "../batch";
 import type { BotContext } from "../bot";
 import { fmtAmount, formatTxCard } from "../card";
 import {
@@ -191,6 +191,26 @@ export function registerEdit(bot: Bot<BotContext>) {
   });
 
   // ---------- per-slip notes for a photo album ----------
+
+  bot.callbackQuery(/^bnote:resume:(\d+)$/, async (ctx) => {
+    const user = ctx.dbUser;
+    if (!user) return;
+    const batch = await getBatch(ctx.env.DB, Number(ctx.match[1]), user.id);
+    if (!batch || !isBatchAnswerable(batch) || batch.state === 'done') {
+      await ctx.answerCallbackQuery({ text: 'That album is no longer waiting.' });
+      return;
+    }
+    await ctx.answerCallbackQuery();
+    await resumeAlbumQuestion(ctx.env.DB, user.id, batch.id);
+    const job = await getAlbumJob(ctx.env.DB, batch.id);
+    if (job?.note_mode === 'shared' && job.accepted_note !== null) {
+      await completeBatchWithNote(ctx.api, ctx.env, user, batch, job.accepted_note);
+    } else if (job?.note_mode === 'each' && batch.state !== 'asking') {
+      await startNoteWalk(ctx.api, ctx.env, user, batch);
+    } else {
+      await ctx.reply(batch.state === 'collecting' ? 'Still reading this album.' : 'This album is active again. What were these slips for?');
+    }
+  });
 
   // "📝 Different note for each" on an album's summary.
   bot.callbackQuery(/^bnote:each:(\d+)$/, async (ctx) => {

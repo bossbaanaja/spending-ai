@@ -1,9 +1,9 @@
 import type { Bot, InlineKeyboard } from "grammy";
-import { deletePendingCustomSplit, setPending } from "../../db/repo";
+import { activateQuestion, consumeQuestion, getActiveQuestion, deletePendingCustomSplit, setPendingForQuestion } from "../../db/repo";
 import { parseSlip } from "../../services/slipParser";
 import { downloadPhotoBase64 } from "../../services/telegramFile";
 import { SlipTimer } from "../../services/timing";
-import { handleAlbumPhoto, supersedeActiveBatch } from "../batch";
+import { handleAlbumPhoto } from "../batch";
 import type { BotContext } from "../bot";
 import { fmtAmount, saveParsedSlip } from "../card";
 
@@ -26,6 +26,7 @@ export function registerSlip(bot: Bot<BotContext>) {
     // media_group_id. batch.ts handles the whole album as a unit; everything
     // below is the single-slip path, unchanged.
     const mediaGroupId = ctx.message.media_group_id;
+    const generation = ctx.message.date * 1_000_000 + ctx.message.message_id;
     if (mediaGroupId) {
       await handleAlbumPhoto(ctx.api, ctx.env, user, {
         chatId: ctx.chat.id,
@@ -33,9 +34,11 @@ export function registerSlip(bot: Bot<BotContext>) {
         mediaGroupId,
         fileId: photo.file_id,
         caption: ctx.message.caption?.trim() || null,
+        generation,
       });
       return;
     }
+    await activateQuestion(ctx.env.DB, user.id, ctx.message.caption?.trim() ? 'none' : 'single', ctx.message.message_id, generation);
 
     // Latency benchmarking: one reqId ties every stage of this slip together
     // in the logs. telegramLagMs is coarse (Telegram truncates message.date
@@ -69,8 +72,11 @@ export function registerSlip(bot: Bot<BotContext>) {
         console.error(JSON.stringify({ event: "slip_done", ref: parsed.trans_ref }));
       } else {
         // One waiting slot per user — this question replaces any album's.
-        await supersedeActiveBatch(ctx.env, user);
-        await setPending(ctx.env.DB, user.id, photo.file_id, JSON.stringify(parsed));
+        const current = await setPendingForQuestion(ctx.env.DB, user.id, generation, photo.file_id, JSON.stringify(parsed));
+        if (!current) {
+          await editStatus('A newer slip or album has replaced this question. Send this photo again to save it.');
+          return;
+        }
         const to = parsed.receiver ? ` to ${parsed.receiver}` : "";
         await editStatus(
           `Got it — ${fmtAmount(parsed.amount, parsed.currency)}${to}.\n\nWhat was this for? (reply with a short note to save it)`,
@@ -79,6 +85,8 @@ export function registerSlip(bot: Bot<BotContext>) {
       }
       timer.logSummary({ telegramLagMs, outcome: caption ? "saved" : "pending" });
     } catch (err) {
+      const current = await getActiveQuestion(ctx.env.DB, user.id);
+      if (current?.kind === 'single' && current.generation === generation) await consumeQuestion(ctx.env.DB, current);
       console.error(JSON.stringify({ event: "slip_failed", error: String(err) }));
       await editStatus(
         "😕 I couldn't read that slip. Try sending a clearer photo of it — or if it keeps failing, send it again later.",

@@ -475,6 +475,12 @@ export async function getBatchByGroup(
  * abandoned yesterday can't swallow today's chat message as a note.
  */
 export async function getActiveBatch(db: D1Database, userId: number): Promise<SlipBatchRow | null> {
+  const question = await getActiveQuestion(db, userId);
+  if (question) {
+    if (question.kind !== 'album' || question.target_id === null) return null;
+    const batch = await getBatch(db, question.target_id, userId);
+    return batch && isBatchAnswerable(batch) && batch.state !== 'done' ? batch : null;
+  }
   return await db
     .prepare(
       `SELECT * FROM slip_batches
@@ -656,10 +662,12 @@ export interface ActiveQuestion {
 
 /** Newer arrivals win; finishing an older parse cannot steal the waiting slot. */
 export async function activateQuestion(db: D1Database, userId: number, kind: ActiveQuestion['kind'], targetId: number | null, generation: number): Promise<void> {
-  await db.prepare(`INSERT INTO active_questions (user_id, kind, target_id, generation) VALUES (?, ?, ?, ?)
+  await db.batch([db.prepare(`INSERT INTO active_questions (user_id, kind, target_id, generation) VALUES (?, ?, ?, ?)
     ON CONFLICT(user_id) DO UPDATE SET kind = excluded.kind, target_id = excluded.target_id,
       generation = excluded.generation, revision = active_questions.revision + 1
-    WHERE excluded.generation > active_questions.generation`).bind(userId, kind, targetId, generation).run();
+    WHERE excluded.generation > active_questions.generation`).bind(userId, kind, targetId, generation),
+    db.prepare("DELETE FROM pending_slips WHERE user_id = ? AND ? = 'single' AND changes() = 1").bind(userId, kind),
+  ]);
 }
 
 export async function getActiveQuestion(db: D1Database, userId: number): Promise<ActiveQuestion | null> {
@@ -674,8 +682,84 @@ export async function consumeQuestion(db: D1Database, question: ActiveQuestion):
   return result.meta.changes === 1;
 }
 
+export async function restoreAlbumQuestion(db: D1Database, question: ActiveQuestion): Promise<void> {
+  await db.prepare(`UPDATE active_questions SET kind = 'album'
+    WHERE user_id = ? AND kind = 'none' AND revision = ? AND target_id = ?
+    AND EXISTS (SELECT 1 FROM slip_batches WHERE id = ? AND state = 'asking')`)
+    .bind(question.user_id, question.revision + 1, question.target_id, question.target_id).run();
+}
+
+export async function rememberAlbumCaption(db: D1Database, batchId: number, caption: string): Promise<void> {
+  await db.prepare(`INSERT INTO album_jobs (batch_id, accepted_note, note_mode) VALUES (?, ?, 'shared')
+    ON CONFLICT(batch_id) DO UPDATE SET accepted_note = excluded.accepted_note, note_mode = 'shared'
+    WHERE album_jobs.note_mode IS NULL`).bind(batchId, caption).run();
+}
+
 export async function getAlbumJob(db: D1Database, batchId: number): Promise<AlbumJob | null> {
   return db.prepare('SELECT * FROM album_jobs WHERE batch_id = ?').bind(batchId).first<AlbumJob>();
+}
+
+/** Atomically select a shared note once. Repeated delivery cannot change it. */
+export async function acceptAlbumNote(db: D1Database, userId: number, batchId: number, note: string): Promise<boolean> {
+  const result = await db.batch([
+    db.prepare('INSERT INTO album_jobs (batch_id) VALUES (?) ON CONFLICT DO NOTHING').bind(batchId),
+    db.prepare(`UPDATE album_jobs SET accepted_note = ?, note_mode = 'shared', desired_version = desired_version + 1
+      WHERE batch_id = ? AND note_mode IS NULL AND EXISTS
+      (SELECT 1 FROM active_questions WHERE user_id = ? AND kind = 'album' AND target_id = ?)`)
+      .bind(note, batchId, userId, batchId),
+  ]);
+  return result[1]?.meta.changes === 1;
+}
+
+/** Clear only this album's question. Never expose an older waiting album. */
+export async function clearAlbumQuestion(db: D1Database, userId: number, batchId: number): Promise<void> {
+  await db.prepare(`UPDATE active_questions SET kind = 'none', revision = revision + 1
+    WHERE user_id = ? AND kind = 'album' AND target_id = ?`).bind(userId, batchId).run();
+}
+
+/** Explicit resume may select an older album without weakening arrival ordering. */
+export async function resumeAlbumQuestion(db: D1Database, userId: number, batchId: number): Promise<void> {
+  await db.prepare(`INSERT INTO active_questions (user_id, kind, target_id, generation) VALUES (?, 'album', ?, 0)
+    ON CONFLICT(user_id) DO UPDATE SET kind = 'album', target_id = excluded.target_id, revision = revision + 1`)
+    .bind(userId, batchId).run();
+}
+
+export async function chooseIndividualNotes(db: D1Database, userId: number, batchId: number): Promise<boolean> {
+  await db.prepare('INSERT INTO album_jobs (batch_id) VALUES (?) ON CONFLICT DO NOTHING').bind(batchId).run();
+  const result = await db.prepare(`UPDATE album_jobs SET note_mode = 'each', desired_version = desired_version + 1
+    WHERE batch_id = ?
+    AND EXISTS (SELECT 1 FROM slip_batches WHERE id = ? AND user_id = ? AND state <> 'asking')`)
+    .bind(batchId, batchId, userId).run();
+  return result.meta.changes === 1;
+}
+
+/** Note write and cursor advance are one transaction; competing replies/skips
+ * for the same index cannot overwrite a note or consume the following slip. */
+export async function commitWalkAnswer(db: D1Database, userId: number, batchId: number, index: number, note: string | null): Promise<boolean> {
+  const guard = `EXISTS (SELECT 1 FROM slip_batches b JOIN active_questions q ON q.user_id = b.user_id
+    WHERE b.id = ? AND b.user_id = ? AND b.state = 'asking' AND b.ask_index = ?
+      AND q.kind = 'album' AND q.target_id = b.id)`;
+  const target = `SELECT id FROM slip_batch_items WHERE batch_id = ? AND outcome = 'saved' AND tx_id IS NOT NULL ORDER BY message_id LIMIT 1 OFFSET ?`;
+  const results = await db.batch([
+    db.prepare(`UPDATE transactions SET note = ? WHERE ? IS NOT NULL AND user_id = ?
+      AND id = (SELECT tx_id FROM slip_batch_items WHERE id = (${target})) AND ${guard}`)
+      .bind(note, note, userId, batchId, index, batchId, userId, index),
+    db.prepare(`UPDATE slip_batch_items SET note = ? WHERE ? IS NOT NULL AND id = (${target}) AND ${guard}`)
+      .bind(note, note, batchId, index, batchId, userId, index),
+    db.prepare(`UPDATE slip_batches SET ask_index = ask_index + 1 WHERE id = ? AND ${guard}`)
+      .bind(batchId, batchId, userId, index),
+  ]);
+  return results[2]?.meta.changes === 1;
+}
+
+export async function setPendingForQuestion(db: D1Database, userId: number, generation: number, fileId: string, parsedJson: string): Promise<boolean> {
+  const condition = "EXISTS (SELECT 1 FROM active_questions WHERE user_id = ? AND kind = 'single' AND generation = ?)";
+  const result = await db.batch([
+    db.prepare(`DELETE FROM pending_slips WHERE user_id = ? AND ${condition}`).bind(userId, userId, generation),
+    db.prepare(`INSERT INTO pending_slips (user_id, file_id, parsed_json) SELECT ?, ?, ? WHERE ${condition}`)
+      .bind(userId, fileId, parsedJson, userId, generation),
+  ]);
+  return result[1]?.meta.changes === 1;
 }
 
 /** Wakeups are durable in D1; publishing to Queues is only a delivery attempt. */

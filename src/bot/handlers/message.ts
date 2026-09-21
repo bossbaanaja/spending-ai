@@ -3,6 +3,8 @@ import {
   deletePending,
   deletePendingCustomSplit,
   getActiveBatch,
+  getActiveQuestion,
+  consumeQuestion,
   getPending,
   getPendingCustomSplit,
   getTransaction,
@@ -60,7 +62,9 @@ export function registerMessage(bot: Bot<BotContext>) {
     const batch = await getActiveBatch(ctx.env.DB, user.id);
     if (batch) {
       try {
-        if (batch.state === "asking") {
+        if (batch.state === 'collecting') {
+          await ctx.reply('I am still reading that album. Please wait for the note question.');
+        } else if (batch.state === "asking") {
           await answerAskNote(ctx.api, ctx.env, user, batch, text);
         } else {
           await completeBatchWithNote(ctx.api, ctx.env, user, batch, text);
@@ -133,12 +137,18 @@ export function registerMessage(bot: Bot<BotContext>) {
       }
     }
 
-    const pending = await getPending(ctx.env.DB, user.id);
+    const question = await getActiveQuestion(ctx.env.DB, user.id);
+    const pending = !question || question.kind === 'single' ? await getPending(ctx.env.DB, user.id) : null;
     if (pending) {
       const parsed = JSON.parse(pending.parsed_json) as ParsedSlip;
       const reply = await saveParsedSlip(ctx.env.DB, user.id, parsed, text);
       await deletePending(ctx.env.DB, user.id);
+      if (question) await consumeQuestion(ctx.env.DB, question);
       await ctx.reply(reply.text, reply.keyboard ? { reply_markup: reply.keyboard } : undefined);
+      return;
+    }
+    if (question?.kind === 'single') {
+      await ctx.reply('I am still reading that slip. Please wait for the note question.');
       return;
     }
 
