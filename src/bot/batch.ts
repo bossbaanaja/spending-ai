@@ -649,6 +649,13 @@ async function pendingItems(
  */
 export async function startNoteWalk(api: Api, env: Env, user: UserRow, batch: SlipBatchRow): Promise<void> {
   const db = env.DB;
+  if (await isQueuedAlbum(db, batch.id)) {
+    if (!await chooseIndividualNotes(db, user.id, batch.id)) return;
+    await resumeAlbumQuestion(db, user.id, batch.id);
+    await wakeAlbum(db, batch.id);
+    await publishAlbum(env, batch.id, 0);
+    return;
+  }
   await wakeAlbum(db, batch.id);
   const token = crypto.randomUUID();
   const job = await claimAlbumJob(db, batch.id, token, Date.now(), 70_000);
@@ -757,10 +764,10 @@ async function askNext(
 
   if (batch.ask_message_id) {
     await api.editMessageText(batch.chat_id, batch.ask_message_id, text, {
-      reply_markup: batchAskKeyboard(batch.id),
+      reply_markup: batchAskKeyboard(batch.id, batch.ask_index),
     });
   } else {
-    const sent = await api.sendMessage(batch.chat_id, text, { reply_markup: batchAskKeyboard(batch.id) });
+    const sent = await api.sendMessage(batch.chat_id, text, { reply_markup: batchAskKeyboard(batch.id, batch.ask_index) });
     await setBatchAskMessage(db, batch.id, sent.message_id);
   }
   return true;

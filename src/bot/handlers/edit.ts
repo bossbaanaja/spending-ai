@@ -234,11 +234,11 @@ export function registerEdit(bot: Bot<BotContext>) {
     await startNoteWalk(ctx.api, ctx.env, user, batch);
   });
 
-  bot.callbackQuery(/^bnote:skip:(\d+)$/, async (ctx) => {
+  bot.callbackQuery(/^bnote:skip:(\d+)(?::(\d+))?$/, async (ctx) => {
     const user = ctx.dbUser;
     if (!user) return;
     const batch = await getBatch(ctx.env.DB, Number(ctx.match[1]), user.id);
-    if (!batch || batch.state !== "asking") {
+    if (!batch || batch.state !== "asking" || ctx.match[2] === undefined || batch.ask_index !== Number(ctx.match[2])) {
       await ctx.answerCallbackQuery({ text: "That question has already been answered." });
       return;
     }

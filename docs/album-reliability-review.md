@@ -93,3 +93,18 @@ Verdict: ship — durable delivery and database idempotency hold across the test
 pipeline. Production resources and canary activation belong to rollout, not this
 commit. Telegram does not provide an idempotent send key: a crash after a successful
 message send but before its ID is stored can duplicate a notification, never an expense.
+
+## Step 4 — queue-driven note walk and stale callback fencing
+
+Intent: ensure albums processed via background queues can transition into per-slip note walks seamlessly, fence against stale or duplicate inline keyboard button presses, and verify end-to-end runtime behavior across Cloudflare D1 and Queues.
+
+Simpler alternative considered: handle the per-slip note walk exclusively through synchronous bot replies and unindexed skip callbacks. Rejected: users tapping skip twice in rapid succession or tapping an old message's skip button would skip the wrong slip, and queue-intake albums without an automatic first prompt would stall waiting for the initial question.
+
+First pass: fix-then-ship. Added queue transition in `startNoteWalk` to wake and publish the album, automatic first-slip prompt trigger in `albumWorker.ts` when all remaining items finish under `note_mode === 'each'`, and index-fenced skip callbacks (`bnote:skip:<batchId>:<index>`) verified against `batch.ask_index` in `edit.ts`. Added baseline database migration (`0000_initial.sql`) and a Miniflare-based Worker runtime test (`test/album-runtime.cjs`).
+
+Trace: `startNoteWalk` in `src/bot/batch.ts` -> checks `isQueuedAlbum` -> sets mode to `each`, wakes album, and publishes to queue -> `processAlbumJob` in `src/bot/albumWorker.ts` -> completes remaining items -> prompts Slip 1 of N with `batchAskKeyboard(batchId, 0)` -> enters `asking` state -> user taps Skip -> `edit.ts` verifies `batch.ask_index === index` -> `advanceNoteWalk` -> message edited in place. Stale or duplicated taps are rejected with an answered alert.
+
+Verification: unit tests cover late caption absorption without asking redundant notes, queue-driven individual note walk cursor retirement upon late photo arrivals, and notification exhaustion avoiding duplicate OCR or rollbacks. Full Miniflare runtime test (`npm run test:runtime`) passes with migrated D1 schema, queue batch processing, late photo handling, and shared note delivery. Full typechecking (`tsc --noEmit`) and all 23 unit tests pass.
+
+Verdict: ship — queued note walk, stale button fencing, and runtime test harness verified.
+

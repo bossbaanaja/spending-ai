@@ -3,7 +3,7 @@ import {
   finishAlbumJob, getActiveQuestion, getAlbumItemWork, getAlbumJob, getAlbumOwner, getBatch,
   getBatchByGroup, getTransaction, isQueuedAlbum, listBatchItems, markAlbumCard,
   ownsAlbumJob, recordAlbumDeliveryFailure, registerQueuedPhoto, rememberAlbumCaption,
-  setBatchAskIndex, setOwnedAlbumState, setBatchStatusMessage,
+  setBatchAskIndex, setBatchAskMessage, setOwnedAlbumState, setBatchStatusMessage,
 } from '../db/repo';
 import { albumQueueEnabled, publishAlbum } from '../services/albumQueue';
 import { albumMessage, AlbumTelegramError } from '../services/albumTelegram';
@@ -12,8 +12,8 @@ import { downloadPhotoBase64 } from '../services/telegramFile';
 import type { ParsedSlip, UserRow } from '../types';
 import { saveAlbumItem } from '../db/repo';
 import { batchTally, type AlbumPhoto } from './batch';
-import { formatBatchSummary, formatTxCard } from './card';
-import { batchNoteKeyboard, txKeyboard } from './keyboards';
+import { fmtAmount, formatBatchSummary, formatTxCard } from './card';
+import { batchAskKeyboard, batchNoteKeyboard, txKeyboard } from './keyboards';
 
 const JOB_LEASE_MS = 120_000;
 const READ_BUDGET_MS = 60_000;
@@ -134,6 +134,23 @@ export async function processAlbumJob(env: Env, batchId: number): Promise<void> 
     try {
       const id = await albumMessage(env, batch.chat_id, text, batch.status_message_id, keyboard);
       await setBatchStatusMessage(db, batchId, id);
+      if (!remaining.length && currentJob?.note_mode === 'each' && batch.state !== 'asking') {
+        const active = await getActiveQuestion(db, user.id);
+        if (active?.kind === 'album' && active.target_id === batchId) {
+          const first = tally.saved[0];
+          if (first) {
+            const prompt = `Slip 1 of ${tally.saved.length} · ${fmtAmount(first.amount, first.currency)} · ${first.receiver ?? first.category}\nWhat was this for?`;
+            const questionId = await albumMessage(env, batch.chat_id, prompt, batch.ask_message_id,
+              batchAskKeyboard(batchId, 0));
+            await setBatchAskIndex(db, batchId, 0);
+            await setBatchAskMessage(db, batchId, questionId);
+            await setOwnedAlbumState(db, batchId, token, 'asking');
+          } else {
+            await setOwnedAlbumState(db, batchId, token, 'done');
+            await clearAlbumQuestion(db, user.id, batchId, token);
+          }
+        }
+      }
       // At most two cards per delivery, bounded independently from saving.
       let sent = 0;
       for (const item of finalItems) {

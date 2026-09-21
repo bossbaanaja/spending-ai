@@ -35,9 +35,9 @@ export function batchNoteKeyboard(batchId: number): InlineKeyboard {
 }
 
 /** Shown under each "slip n of N — what was this for?" question. */
-export function batchAskKeyboard(batchId: number): InlineKeyboard {
+export function batchAskKeyboard(batchId: number, index = 0): InlineKeyboard {
   return new InlineKeyboard()
-    .text("⏭ Skip", `bnote:skip:${batchId}`)
+    .text("⏭ Skip", `bnote:skip:${batchId}:${index}`)
     .text("✅ Stop asking", `bnote:stop:${batchId}`);
 }
 

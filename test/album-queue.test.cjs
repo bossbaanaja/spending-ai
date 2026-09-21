@@ -153,3 +153,41 @@ test('queued webhook returns 503 on persistence failure and accepts the same upd
   await h.drain();
   assert.equal(h.parsed.length, 1);
 });
+
+test('late caption is picked up after OCR, without an unnecessary note question', async () => {
+  const h = await setup();
+  await h.intake(1, null);
+  h.hook(() => h.intake(2, 'late caption'));
+  await h.drain();
+  const rows = h.db.sqlite.prepare('SELECT note FROM transactions').all();
+  assert.equal(rows.length, 2);
+  assert.ok(rows.every(row => row.note === 'late caption'));
+  assert.equal((await h.batch()).state, 'done');
+});
+
+test('individual notes save through queue; a late photo retires the old cursor', async () => {
+  const h = await setup();
+  await h.intake(2, null); await h.intake(3, null); await h.drain();
+  const handler = h.load('src/bot/batch.ts');
+  await handler.startNoteWalk({}, h.env, h.user, await h.batch());
+  await h.drain();
+  const b = await h.batch();
+  assert.equal(b.state, 'asking');
+  assert.ok(h.messages.some(m => m.includes('Slip 1 of 2')));
+  await h.repo.commitWalkAnswer(h.db, h.user.id, b.id, 0, 'first note');
+  await h.intake(1, null);
+  assert.equal((await h.batch()).state, 'awaiting_note');
+  assert.equal(await h.repo.commitWalkAnswer(h.db, h.user.id, b.id, 1, 'stale answer'), false);
+  await h.drain();
+  assert.equal(h.db.sqlite.prepare('SELECT count(*) AS n FROM transactions').get().n, 3);
+  assert.equal((await h.repo.getActiveQuestion(h.db, h.user.id)).kind, 'none');
+});
+
+test('notification exhaustion does not repeat OCR or undo expenses', async () => {
+  const h = await setup({ failTelegram: true });
+  await h.intake(1);
+  await h.drain();
+  assert.equal(h.parsed.length, 1);
+  assert.equal(h.db.sqlite.prepare('SELECT count(*) AS n FROM transactions').get().n, 1);
+  assert.equal((await h.repo.getAlbumJob(h.db, (await h.batch()).id)).delivery_attempts, 6);
+});
