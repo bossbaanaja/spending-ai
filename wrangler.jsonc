@@ -14,7 +14,7 @@
   },
   "vars": {
     // Empty = legacy intake. Comma-separated Telegram IDs = canary. '*' = all.
-    "ALBUM_QUEUE_USERS": "",
+    "ALBUM_QUEUE_USERS": "*",
     // Fallback chain, tried left to right (see nim.ts modelRotation). Retries
     // rotate through the whole list; the hedged slip parse races two requests
     // starting half a list apart so they land in different NIM queues. Add or
