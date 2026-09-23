@@ -73,6 +73,27 @@ async function runAlbumJob(env: Env, batchId: number, trace: AlbumTrace): Promis
     let currentJob = await getAlbumJob(db, batchId);
     const caption = batch.caption;
     const items = await listBatchItems(db, batchId);
+    const readItems = new Set(items.filter(item => item.parsed_json).map(item => item.id));
+    // Serialize edits so parallel reads cannot make the displayed count go backwards.
+    // Progress is best-effort: a Telegram failure must never fail a slip's read/save.
+    let progressEdits = Promise.resolve();
+    let progressUnavailable = false;
+    const reportRead = (itemId: number): Promise<void> => {
+      readItems.add(itemId);
+      const text = `🔍 Read ${readItems.size}/${items.length} slips…`;
+      progressEdits = progressEdits.then(async () => {
+        if (progressUnavailable || !batch?.status_message_id || !await ownsAlbumJob(db, batchId, token)) return;
+        const id = await trace.measure('read_progress', () => albumMessage(env, batch!.chat_id, text, batch!.status_message_id));
+        if (id !== batch.status_message_id) {
+          await setBatchStatusMessage(db, batchId, id);
+          batch = { ...batch, status_message_id: id };
+        }
+      }).catch(error => {
+        progressUnavailable = true;
+        console.error(JSON.stringify({ event: 'album_progress_failed', batch: batchId, error: String(error) }));
+      });
+      return progressEdits;
+    };
     const candidates = items.slice(0, 10).filter(item => item.outcome === 'queued' && (!item.parsed_json || currentJob?.note_mode));
     const deadline = Date.now() + READ_BUDGET_MS;
     let failedAttempt = false;
@@ -94,6 +115,7 @@ async function runAlbumJob(env: Env, batchId: number, trace: AlbumTrace): Promis
               onOcr: text => checkpointAlbumItem(db, item.id, token, { ocr: text }),
             });
             await itemTrace.measure('parsed_checkpoint', () => checkpointAlbumItem(db, item.id, token, { parsed: JSON.stringify(parsed) }));
+            await reportRead(item.id);
           }
           // Re-read the note decision: a caption or accepted answer may arrive
           // while OCR is running. Individual notes must never inherit shared text.
@@ -128,7 +150,7 @@ async function runAlbumJob(env: Env, batchId: number, trace: AlbumTrace): Promis
     let text: string;
     let keyboard = batchNoteKeyboard(batchId);
     if (remaining.length) {
-      text = `🔍 ${finalItems.length - remaining.length}/${finalItems.length} slips processed. Continuing automatically…`;
+      text = `🔍 Read ${finalItems.filter(item => item.parsed_json).length}/${finalItems.length} slips. Continuing automatically…`;
     } else if (!currentJob?.note_mode && ready.length) {
       await setOwnedAlbumState(db, batchId, token, 'awaiting_note');
       const active = await getActiveQuestion(db, user.id);
