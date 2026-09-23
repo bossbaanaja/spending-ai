@@ -1,6 +1,6 @@
 import { asCategory, CATEGORIES, type ParsedSlip } from "../types";
 import { nimChat, nimChatHedged, type NimChatResult } from "./nim";
-import type { SlipTimer } from "./timing";
+import type { AlbumTrace, SlipTimer } from "./timing";
 import { typhoonOcrImage } from "./typhoonOcr";
 
 const SLIP_PROMPT = `You read text extracted by OCR from Thai mobile-banking payment slips (KBank, SCB, Bangkok Bank, Krungthai, PromptPay, TrueMoney Wallet, etc.). The OCR text is markdown and may contain HTML tables or minor OCR noise.
@@ -24,6 +24,7 @@ Rules:
 - Respond with ONLY the JSON object. No explanation, no markdown fences.`;
 
 export interface ParseSlipOptions {
+  trace?: AlbumTrace;
   cachedOcr?: string;
   onOcr?: (text: string) => Promise<void>;
   /**
@@ -72,8 +73,10 @@ export async function parseSlip(
   // leaves the slip handler time to edit the status bubble with the error
   // instead of being cancelled mid-flight with the bubble stuck.
   const { deadline = Date.now() + 65_000, hedge = true, startIndex = 0, nimTimeoutMs } = options;
-  const ocrText = options.cachedOcr ?? await typhoonOcrImage(imageBase64, env, deadline);
-  if (!options.cachedOcr) await options.onOcr?.(ocrText);
+  const measure = <T>(stage: string, work: () => Promise<T>) => options.trace ? options.trace.measure(stage, work) : work();
+  const ocrText = options.cachedOcr ?? await measure('ocr', () => typhoonOcrImage(imageBase64, env, deadline));
+  if (options.cachedOcr !== undefined) options.trace?.event('ocr_reused');
+  if (!options.cachedOcr && options.onOcr) await measure('ocr_checkpoint', () => options.onOcr!(ocrText));
   timer?.mark("ocr_done");
   console.error(JSON.stringify({ event: "slip_ocr_done", chars: ocrText.length }));
 
@@ -96,9 +99,9 @@ export async function parseSlip(
   // Hedged: primary and backup model raced, first *valid* answer wins — a
   // truncated or malformed response loses the race instead of poisoning it.
   // Unhedged still walks the whole fallback chain (NIM_MODELS), one at a time.
-  const result = hedge
+  const result = await measure('nim_extract', async () => hedge
     ? await nimChatHedged(env, messages, { maxTokens: 2048, deadline }, toSlip)
-    : toSlip(await nimChat(env, messages, { maxTokens: 2048, deadline, startIndex, timeoutMs: nimTimeoutMs }));
+    : toSlip(await nimChat(env, messages, { maxTokens: 2048, deadline, startIndex, timeoutMs: nimTimeoutMs })));
   timer?.mark("nim_done");
   return result;
 }

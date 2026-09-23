@@ -1,4 +1,5 @@
 import { isQueuedAlbum, listDueAlbumJobs } from '../db/repo';
+import { AlbumTrace } from './timing';
 
 export function albumQueueEnabled(env: Env, telegramId: number): boolean {
   const users = (env.ALBUM_QUEUE_USERS ?? '').split(',').map(value => value.trim());
@@ -8,7 +9,9 @@ export function albumQueueEnabled(env: Env, telegramId: number): boolean {
 /** D1 is the durable outbox. A failed publish is picked up by the minute cron. */
 export async function publishAlbum(env: Env, batchId: number, delaySeconds = 3): Promise<void> {
   try {
-    await env.ALBUM_QUEUE.send({ batchId }, { delaySeconds });
+    const enqueuedAtMs = Date.now();
+    await new AlbumTrace({ batchId, enqueuedAtMs, delaySeconds }).measure('queue_publish', () =>
+      env.ALBUM_QUEUE.send({ batchId, enqueuedAtMs, delaySeconds }, { delaySeconds }));
   } catch (error) {
     console.error(JSON.stringify({ event: 'album_queue_publish_failed', batch: batchId, error: String(error) }));
   }

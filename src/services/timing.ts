@@ -37,3 +37,32 @@ export class SlipTimer {
     );
   }
 }
+
+/** Epoch timestamps connect album work across webhook and queue invocations.
+ * Emit starts too, so a terminated invocation leaves a visible unfinished step. */
+export class AlbumTrace {
+  constructor(private readonly context: Record<string, unknown>) {}
+
+  child(details: Record<string, unknown>): AlbumTrace {
+    return new AlbumTrace({ ...this.context, ...details });
+  }
+
+  event(stage: string, details: Record<string, unknown> = {}): void {
+    console.error(JSON.stringify({ event: 'album_timing', ...this.context, stage, atMs: Date.now(), ...details }));
+  }
+
+  async measure<T>(stage: string, work: () => Promise<T>): Promise<T> {
+    const startedAtMs = Date.now();
+    const spanId = crypto.randomUUID();
+    this.event(stage, { phase: 'start', spanId });
+    let outcome = 'ok';
+    try {
+      return await work();
+    } catch (error) {
+      outcome = 'error';
+      throw error;
+    } finally {
+      this.event(stage, { phase: 'end', spanId, startedAtMs, durationMs: Date.now() - startedAtMs, outcome });
+    }
+  }
+}

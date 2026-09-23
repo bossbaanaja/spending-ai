@@ -4,6 +4,7 @@ import { sendDailyReports } from "./scheduled/dailyReport";
 import { getUserByTelegramId } from './db/repo';
 import { intakeQueuedAlbum, processAlbumJob } from './bot/albumWorker';
 import { recoverAlbumJobs } from './services/albumQueue';
+import { AlbumTrace } from './services/timing';
 
 // If Telegram doesn't get a 200 in time (we now hold the response while model
 // calls run), it redelivers the update. Isolate-local dedup is enough: the
@@ -40,6 +41,10 @@ export default {
       // failure must return 503 so Telegram can retry, even in this isolate.
       const message = update.message;
       if (message?.photo && message.media_group_id && message.from) {
+        new AlbumTrace({ mediaGroupId: message.media_group_id, messageId: message.message_id }).event('webhook_photo_received', {
+          telegramSentAtMs: message.date * 1000,
+          telegramLagMs: Date.now() - message.date * 1000,
+        });
         try {
           const user = await getUserByTelegramId(env.DB, message.from.id);
           const photos = message.photo;
@@ -115,7 +120,10 @@ export default {
         continue;
       }
       try {
-        await processAlbumJob(env, body.batchId);
+        await processAlbumJob(env, body.batchId, {
+          enqueuedAtMs: 'enqueuedAtMs' in body && typeof body.enqueuedAtMs === 'number' ? body.enqueuedAtMs : undefined,
+          delaySeconds: 'delaySeconds' in body && typeof body.delaySeconds === 'number' ? body.delaySeconds : undefined,
+        });
         message.ack();
       } catch (error) {
         console.error(JSON.stringify({ event: 'album_job_failed', batch: body.batchId, error: String(error) }));

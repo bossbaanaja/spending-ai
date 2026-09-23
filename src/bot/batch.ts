@@ -54,6 +54,7 @@ import {
 } from "../db/repo";
 import { parseSlip } from "../services/slipParser";
 import { publishAlbum } from '../services/albumQueue';
+import { AlbumTrace } from '../services/timing';
 import { downloadPhotoBase64 } from "../services/telegramFile";
 import type {
   BatchItemOutcome,
@@ -552,8 +553,10 @@ export async function completeBatchWithNote(
   note: string,
 ): Promise<void> {
   const db = env.DB;
+  const trace = new AlbumTrace({ batchId: batch.id });
+  trace.event('shared_note_received');
   // First accepted note is durable. A retry finishes with that same note.
-  const accepted = await acceptAlbumNote(db, user.id, batch.id, note);
+  const accepted = await trace.measure('shared_note_accept', () => acceptAlbumNote(db, user.id, batch.id, note));
   const previous = await getAlbumJob(db, batch.id);
   if (!accepted && previous?.note_mode !== 'shared') return;
   note = previous?.accepted_note ?? note;
@@ -561,6 +564,7 @@ export async function completeBatchWithNote(
   if (await isQueuedAlbum(db, batch.id)) {
     await clearAlbumQuestion(db, user.id, batch.id);
     await publishAlbum(env, batch.id, 0);
+    trace.event('shared_note_queued');
     return;
   }
   const token = crypto.randomUUID();
@@ -649,11 +653,14 @@ async function pendingItems(
  */
 export async function startNoteWalk(api: Api, env: Env, user: UserRow, batch: SlipBatchRow): Promise<void> {
   const db = env.DB;
+  const trace = new AlbumTrace({ batchId: batch.id });
+  trace.event('individual_notes_requested');
   if (await isQueuedAlbum(db, batch.id)) {
     if (!await chooseIndividualNotes(db, user.id, batch.id)) return;
     await resumeAlbumQuestion(db, user.id, batch.id);
     await wakeAlbum(db, batch.id);
     await publishAlbum(env, batch.id, 0);
+    trace.event('individual_notes_queued');
     return;
   }
   await wakeAlbum(db, batch.id);
@@ -708,8 +715,12 @@ export async function answerAskNote(
   note: string,
 ): Promise<void> {
   const db = env.DB;
-  if (!await commitWalkAnswer(db, user.id, batch.id, batch.ask_index, note)) return;
-  await askNext(api, env, user, { ...batch, ask_index: batch.ask_index + 1 }, `Saved as "${note}".`);
+  const trace = new AlbumTrace({ batchId: batch.id, index: batch.ask_index });
+  trace.event('individual_note_received');
+  await trace.measure('note_reply_to_next_prompt', async () => {
+    if (!await trace.measure('individual_note_save', () => commitWalkAnswer(db, user.id, batch.id, batch.ask_index, note))) return;
+    await askNext(api, env, user, { ...batch, ask_index: batch.ask_index + 1 }, `Saved as "${note}".`);
+  });
 }
 
 /** ⏭ Skip / the answer landed — move the cursor on and ask the next one. */
@@ -720,6 +731,7 @@ export async function advanceNoteWalk(
   batch: SlipBatchRow,
   confirmation: string | null,
 ): Promise<void> {
+  new AlbumTrace({ batchId: batch.id, index: batch.ask_index }).event('note_skipped');
   const nextIndex = batch.ask_index + 1;
   if (!await commitWalkAnswer(env.DB, user.id, batch.id, batch.ask_index, null)) return;
   await askNext(api, env, user, { ...batch, ask_index: nextIndex }, confirmation);
@@ -738,6 +750,7 @@ async function askNext(
   confirmation: string | null,
 ): Promise<boolean> {
   const db = env.DB;
+  const trace = new AlbumTrace({ batchId: batch.id, index: batch.ask_index });
   const saved = (await listBatchItems(db, batch.id)).filter((item) => item.outcome === "saved" && item.tx_id);
   const item = saved[batch.ask_index];
   const txId = item?.tx_id;
@@ -763,25 +776,31 @@ async function askNext(
     .join("\n");
 
   if (batch.ask_message_id) {
-    await api.editMessageText(batch.chat_id, batch.ask_message_id, text, {
+    await trace.measure('note_prompt', () => api.editMessageText(batch.chat_id, batch.ask_message_id!, text, {
       reply_markup: batchAskKeyboard(batch.id, batch.ask_index),
-    });
+    }));
   } else {
-    const sent = await api.sendMessage(batch.chat_id, text, { reply_markup: batchAskKeyboard(batch.id, batch.ask_index) });
+    const sent = await trace.measure('note_prompt', () => api.sendMessage(batch.chat_id, text, { reply_markup: batchAskKeyboard(batch.id, batch.ask_index) }));
     await setBatchAskMessage(db, batch.id, sent.message_id);
   }
+  trace.event('note_prompt_delivered');
   return true;
 }
 
 /** ✅ Stop asking, or the walk ran out of slips. */
 export async function finishNoteWalk(api: Api, env: Env, batch: SlipBatchRow, text: string): Promise<void> {
-  await setBatchState(env.DB, batch.id, "done");
-  await clearAlbumQuestion(env.DB, batch.user_id, batch.id);
-  if (batch.ask_message_id) {
-    await api.editMessageText(batch.chat_id, batch.ask_message_id, text);
-  } else {
-    await api.sendMessage(batch.chat_id, text);
-  }
+  const trace = new AlbumTrace({ batchId: batch.id });
+  trace.event('note_walk_finish_requested');
+  await trace.measure('note_walk_finish', async () => {
+    await setBatchState(env.DB, batch.id, "done");
+    await clearAlbumQuestion(env.DB, batch.user_id, batch.id);
+    if (batch.ask_message_id) {
+      await api.editMessageText(batch.chat_id, batch.ask_message_id, text);
+    } else {
+      await api.sendMessage(batch.chat_id, text);
+    }
+  });
+  trace.event('note_walk_complete');
 }
 
 /** A new single slip takes over the one "waiting for a note" slot. */
