@@ -140,6 +140,87 @@ export async function deleteTransaction(db: D1Database, id: number, userId: numb
 
 // ---------- splits ----------
 
+export type VersionedTransaction = TransactionRow & { identity: string; revision: number; split_token: string | null };
+
+export async function getVersionedTransaction(db: D1Database, id: number, userId: number): Promise<VersionedTransaction | null> {
+  return db.prepare(`SELECT t.*, v.identity, v.revision, v.split_token FROM transactions t
+    JOIN transaction_versions v ON v.tx_id = t.id WHERE t.id = ? AND t.user_id = ?`)
+    .bind(id, userId).first<VersionedTransaction>();
+}
+
+/** Optimistic write + retry receipt in one D1 transaction. Triggers version every edit, including Undo. */
+export async function savePanelShare(db: D1Database, id: number, userId: number, amount: number,
+  expected: { identity: string; revision: number; operation: string }): Promise<VersionedTransaction | null> {
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  await db.batch([
+    db.prepare(`UPDATE transactions SET amount = ?, original_amount = COALESCE(original_amount, amount),
+      split_kind = 'people', split_part = 1, split_total = NULL
+      WHERE id = ? AND user_id = ? AND (split_kind IS NULL OR split_kind <> 'month')
+      AND ? <= COALESCE(original_amount, amount)
+      AND EXISTS (SELECT 1 FROM transaction_versions WHERE tx_id = transactions.id AND identity = ? AND revision = ?)`)
+      .bind(amount, id, userId, amount, expected.identity, expected.revision),
+    // changes() is the preceding outer UPDATE's result, not the trigger's internal writes.
+    db.prepare(`UPDATE transaction_versions SET split_token = ? WHERE changes() = 1
+      AND tx_id = ? AND identity = ? AND revision = ?`)
+      .bind(expected.operation, id, expected.identity, expected.revision + 1),
+  ]);
+  const current = await getVersionedTransaction(db, id, userId);
+  return current?.identity === expected.identity && current.revision === expected.revision + 1 &&
+    current.split_token === expected.operation && current.amount === amount ? current : null;
+}
+
+export interface TransactionCardJob {
+  chat_id: number; message_id: number; tx_id: number; user_id: number; identity: string;
+  generation: number; completed_generation: number; lease_token: string | null;
+  lease_until: number; attempts: number; next_run_at: number;
+}
+
+export async function requestTransactionCard(db: D1Database, txId: number, userId: number, identity: string,
+  chatId: number, messageId: number): Promise<void> {
+  await db.prepare(`INSERT INTO transaction_card_jobs (chat_id, message_id, tx_id, user_id, identity)
+    VALUES (?, ?, ?, ?, ?) ON CONFLICT(chat_id, message_id) DO UPDATE SET
+    generation = generation + 1, attempts = 0, next_run_at = 0
+    WHERE transaction_card_jobs.identity = excluded.identity`)
+    .bind(chatId, messageId, txId, userId, identity).run();
+}
+
+export async function getTransactionCardJob(db: D1Database, chatId: number, messageId: number): Promise<TransactionCardJob | null> {
+  return db.prepare('SELECT * FROM transaction_card_jobs WHERE chat_id = ? AND message_id = ?')
+    .bind(chatId, messageId).first<TransactionCardJob>();
+}
+
+export async function claimTransactionCard(db: D1Database, chatId: number, messageId: number, token: string,
+  now = Date.now()): Promise<TransactionCardJob | null> {
+  return db.prepare(`UPDATE transaction_card_jobs SET lease_token = ?, lease_until = ?
+    WHERE chat_id = ? AND message_id = ? AND lease_until <= ? AND next_run_at <= ?
+    AND generation > completed_generation AND attempts < 5 RETURNING *`)
+    .bind(token, now + 45_000, chatId, messageId, now, now).first<TransactionCardJob>();
+}
+
+export async function finishTransactionCard(db: D1Database, job: TransactionCardJob, token: string, sent: boolean): Promise<boolean> {
+  const result = await db.prepare(`UPDATE transaction_card_jobs SET
+    completed_generation = CASE WHEN ? THEN MAX(completed_generation, ?) ELSE completed_generation END,
+    lease_token = NULL, lease_until = 0,
+    attempts = CASE WHEN ? THEN 0 ELSE attempts + 1 END,
+    next_run_at = CASE WHEN ? THEN 0 ELSE ? END
+    WHERE chat_id = ? AND message_id = ? AND lease_token = ?`)
+    .bind(Number(sent), job.generation, Number(sent), Number(sent), Date.now() + 60_000, job.chat_id, job.message_id, token).run();
+  if (result.meta.changes === 0) {
+    // An expired sender may have completed after its successor. Schedule repair.
+    await requestTransactionCard(db, job.tx_id, job.user_id, job.identity, job.chat_id, job.message_id);
+    return false;
+  }
+  const current = await getTransactionCardJob(db, job.chat_id, job.message_id);
+  return sent && current?.generation === current?.completed_generation;
+}
+
+export async function listPendingTransactionCards(db: D1Database, now = Date.now()): Promise<TransactionCardJob[]> {
+  const rows = await db.prepare(`SELECT * FROM transaction_card_jobs
+    WHERE generation > completed_generation AND lease_until <= ? AND next_run_at <= ? AND attempts < 5
+    ORDER BY next_run_at, chat_id, message_id LIMIT 2`).bind(now, now).all<TransactionCardJob>();
+  return rows.results;
+}
+
 /**
  * "I paid for the group": keeps only the user's share of the entry and drops the
  * rest — other people's money was never their spending. Re-splitting divides the
@@ -179,8 +260,9 @@ export async function splitByCustom(
   userId: number,
   myShare: number,
 ): Promise<TransactionRow | null> {
-  const tx = await getTransaction(db, id, userId);
-  if (!tx) return null;
+  if (!Number.isFinite(myShare) || myShare <= 0) return null;
+  myShare = Math.round(myShare * 100) / 100;
+  if (myShare <= 0) return null;
 
   return await db
     .prepare(
@@ -188,9 +270,11 @@ export async function splitByCustom(
           SET amount = ?, original_amount = COALESCE(original_amount, amount),
               split_kind = 'people', split_part = 1, split_total = NULL
         WHERE id = ? AND user_id = ?
+          AND (split_kind IS NULL OR split_kind <> 'month')
+          AND ? <= COALESCE(original_amount, amount)
        RETURNING *`,
     )
-    .bind(myShare, id, userId)
+    .bind(myShare, id, userId, myShare)
     .first<TransactionRow>();
 }
 
@@ -205,7 +289,7 @@ export async function splitByMonths(
   userId: number,
   months: number,
 ): Promise<TransactionRow | null> {
-  const tx = await getTransaction(db, id, userId);
+  const tx = await getVersionedTransaction(db, id, userId);
   if (!tx || tx.split_kind === "month") return null;
 
   const group = crypto.randomUUID();
@@ -214,22 +298,25 @@ export async function splitByMonths(
 
   // SQLite evaluates every SET expression against the pre-update row, so the
   // COALESCE still sees the old amount even though amount is reassigned here.
-  await db.batch([
+  const results = await db.batch<TransactionRow>([
     db
       .prepare(
         `UPDATE transactions
             SET amount = ?, slip_datetime = ?, original_amount = COALESCE(original_amount, amount),
                 split_kind = 'month', split_group = ?, split_part = 1, split_total = ?
-          WHERE id = ? AND user_id = ?`,
+          WHERE id = ? AND user_id = ?
+            AND EXISTS (SELECT 1 FROM transaction_versions WHERE tx_id = transactions.id AND identity = ? AND revision = ?)
+          RETURNING *`,
       )
-      .bind(first.amount, first.slipDatetime, group, months, id, userId),
+      .bind(first.amount, first.slipDatetime, group, months, id, userId, tx.identity, tx.revision),
     ...rest.map((part) =>
       db
         .prepare(
           `INSERT INTO transactions
              (user_id, amount, currency, category, note, receiver, bank, trans_ref, slip_datetime,
               raw_json, split_kind, split_group, split_part, split_total)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'month', ?, ?, ?)`,
+           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'month', ?, ?, ?
+           WHERE EXISTS (SELECT 1 FROM transactions WHERE id = ? AND user_id = ? AND split_group = ?)`,
         )
         .bind(
           userId,
@@ -245,11 +332,12 @@ export async function splitByMonths(
           group,
           part.part,
           months,
+          id, userId, group,
         ),
     ),
   ]);
 
-  return await getTransaction(db, id, userId);
+  return results[0]?.results[0] ?? null;
 }
 
 /**

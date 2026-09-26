@@ -3,6 +3,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const { Miniflare } = require('miniflare');
+const { sqlStatements } = require('./support.cjs');
 
 test('real Worker runtime: migrated D1, queue delivery, late photo and shared note', { timeout: 60000 }, async () => {
   let messageId = 1000;
@@ -34,13 +35,14 @@ test('real Worker runtime: migrated D1, queue delivery, late photo and shared no
   try {
     const db = await mf.getD1Database('DB');
     const exec = async sql => {
-      for (const statement of sql.replace(/--[^\r\n]*/g, '').split(';').map(s => s.trim()).filter(Boolean)) await db.prepare(statement).run();
+      for (const statement of sqlStatements(sql)) await db.prepare(statement).run();
     };
     const fresh = fs.readFileSync('src/db/schema.sql', 'utf8');
     const old = fresh.split('-- Durable album scheduling.')[0].replace(/^.*source_item_id.*\n/m, '');
     await exec(old);
     await exec(fs.readFileSync('src/db/migrations/0001_album_reliability.sql', 'utf8'));
     await exec(fs.readFileSync('src/db/migrations/0002_album_queue.sql', 'utf8'));
+    await exec(fs.readFileSync('src/db/migrations/0003_split_panel_safety.sql', 'utf8'));
     await db.prepare("INSERT INTO users (id, telegram_id, role, token) VALUES (1, 1, 'member', 'test')").run();
     const from = { id: 1, is_bot: false, first_name: 'Test' };
     const post = async message => {

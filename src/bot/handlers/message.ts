@@ -8,6 +8,8 @@ import {
   getPending,
   getPendingCustomSplit,
   getTransaction,
+  getVersionedTransaction,
+  requestTransactionCard,
   splitByCustom,
 } from "../../db/repo";
 import { parseCustomAmount } from "../../split";
@@ -17,6 +19,7 @@ import { answerAskNote, completeBatchWithNote } from "../batch";
 import type { BotContext } from "../bot";
 import { fmtAmount, formatTxCard, saveParsedSlip } from "../card";
 import { txKeyboard } from "../keyboards";
+import { flushTransactionCard } from '../cardRefresh';
 
 /**
  * Plain-text fallback, registered last so real commands win. Answers whatever
@@ -84,7 +87,7 @@ export function registerMessage(bot: Bot<BotContext>) {
       if (isExpired) {
         await deletePendingCustomSplit(ctx.env.DB, user.id);
       } else {
-        const tx = await getTransaction(ctx.env.DB, pendingSplit.tx_id, user.id);
+        const tx = await getVersionedTransaction(ctx.env.DB, pendingSplit.tx_id, user.id);
         if (!tx) {
           await deletePendingCustomSplit(ctx.env.DB, user.id);
           await ctx.reply("That entry no longer exists.");
@@ -113,6 +116,9 @@ export function registerMessage(bot: Bot<BotContext>) {
           return;
         }
 
+        if (pendingSplit.message_id && ctx.chat) {
+          await requestTransactionCard(ctx.env.DB, tx.id, user.id, tx.identity, ctx.chat.id, pendingSplit.message_id);
+        }
         const updated = await splitByCustom(ctx.env.DB, tx.id, user.id, myShare);
         await deletePendingCustomSplit(ctx.env.DB, user.id);
 
@@ -123,11 +129,7 @@ export function registerMessage(bot: Bot<BotContext>) {
 
         // Restore and update the card message in place
         if (pendingSplit.message_id && ctx.chat) {
-          await ctx.api
-            .editMessageText(ctx.chat.id, pendingSplit.message_id, formatTxCard(updated), {
-              reply_markup: txKeyboard(updated),
-            })
-            .catch(() => {});
+          await flushTransactionCard(ctx.env, ctx.chat.id, pendingSplit.message_id).catch(() => {});
         }
 
         await ctx.reply(

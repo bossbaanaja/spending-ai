@@ -42,12 +42,13 @@ export function batchAskKeyboard(batchId: number, index = 0): InlineKeyboard {
 }
 
 /** Step 1 of the split flow: which kind of split. */
-export function splitModeKeyboard(txId: number): InlineKeyboard {
-  return new InlineKeyboard()
+export function splitModeKeyboard(txId: number, panelUrl?: string): InlineKeyboard {
+  const kb = new InlineKeyboard()
     .text("👥 Between people", `splitp:${txId}`)
-    .row()
-    .text("✏️ My share was…", `splitc:${txId}`)
-    .row()
+    .row();
+  if (panelUrl) kb.webApp("✏️ My share was…", panelUrl);
+  else kb.text("✏️ My share was…", `splitc:${txId}`);
+  return kb.row()
     .text("🗓 Across months", `splitm:${txId}`)
     .row()
     .text("◀️ Back", `splitback:${txId}`);

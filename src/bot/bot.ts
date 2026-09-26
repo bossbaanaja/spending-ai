@@ -11,20 +11,23 @@ import { registerStart } from "./handlers/start";
 export type BotContext = Context & {
   env: Env;
   dbUser: UserRow | null;
+  panelOrigin: string;
 };
 
 // Config-scoped cache: env bindings are stable for the isolate's lifetime, so
 // the bot is built once per isolate, not per update.
 let cachedBot: Bot<BotContext> | null = null;
+let cachedOrigin = '';
 
-export function getBot(env: Env): Bot<BotContext> {
-  if (cachedBot) return cachedBot;
+export function getBot(env: Env, panelOrigin = ''): Bot<BotContext> {
+  if (cachedBot && cachedOrigin === panelOrigin) return cachedBot;
 
   const bot = new Bot<BotContext>(env.BOT_TOKEN, { client: { timeoutSeconds: 8 } });
 
   // Attach env + the registered user (if any) to every update.
   bot.use(async (ctx, next) => {
     ctx.env = env;
+    ctx.panelOrigin = panelOrigin;
     ctx.dbUser = ctx.from ? await getUserByTelegramId(env.DB, ctx.from.id) : null;
     await next();
   });
@@ -56,5 +59,6 @@ export function getBot(env: Env): Bot<BotContext> {
   });
 
   cachedBot = bot;
+  cachedOrigin = panelOrigin;
   return bot;
 }

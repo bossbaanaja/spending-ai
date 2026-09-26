@@ -11,7 +11,7 @@ An intelligent Telegram spending tracker built for **Cloudflare Workers**. It au
 - 🛡️ **Duplicate Detection**: Uses transaction reference numbers from slips to prevent logging the same payment twice.
 - ✂️ **Instant Bill Splitting**:
   - **👥 Between People**: Paid for a group? Keep only your share (e.g. ฿1,200 ÷ 4 = ฿300) and drop the rest from your totals.
-  - **✏️ Custom Share ("My share was…")**: Non-equal split? Type the exact net amount you paid (e.g. `5,000` or `5,500 - 500`) when someone covers part of the bill.
+  - **✏️ Custom Share ("My share was…")**: Opens an amount-entry panel inside Telegram in private chats. Type your net share (e.g. `5,000` or `5,500 - 500`) and tap Save to update the original card. Group chats retain the text-reply flow.
   - **🗓 Across Months**: Large annual payment (e.g. car insurance)? Spread it into equal monthly portions across future months.
   - **↩️ Undo Split**: Reverts splits back to the original amount at any time.
 - 📊 **Monthly Dashboard & Charts**: `/dashboard` displays spending totals, category breakdowns, and top merchants with an auto-generated visual chart. Past months can be viewed via `/dashboard YYYY-MM`.
@@ -87,6 +87,16 @@ Apply the database schema:
 npm run db:apply
 ```
 *(For local development, run `npm run db:apply:local`)*
+
+**Upgrading an existing installation for the split panel:** apply the additive migration before deploying the new Worker:
+
+```bash
+npx wrangler d1 execute spending_ai --remote --file src/db/migrations/0003_split_panel_safety.sql
+```
+
+This preserves expenses and adds immutable expense identities, edit versions, and recoverable card refreshes. Fresh databases get these through `schema.sql`. The panel uses the existing HTTPS webhook origin, bot token, database, and minute cron; no new secrets or bindings are needed. The minute cron retries interrupted card refreshes up to five failed attempts; reopening Split and saving retries a failed refresh again.
+
+Validation: `npm run check`, `npm test`, and `npm run test:runtime`. The runtime command builds without deploying and tests a local Worker/D1 instance with fake Telegram responses.
 
 ### 3. Configure Secrets
 

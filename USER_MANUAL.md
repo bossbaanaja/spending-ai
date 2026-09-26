@@ -80,10 +80,9 @@ The card then shows a reminder of what happened:
 
 ### ✏️ My share was… — *non-equal split / custom amount*
 
-You paid a ฿2,800 bill, but a friend paid ฿520 for their portion (so your net share was only ฿2,280). Tap **✂️ Split → ✏️ My share was…**, and the bot prompts:
-> *"How much was actually yours? Reply with the amount (e.g. 2280 or 2800 - 520)."*
+You paid a ฿2,800 bill, but a friend paid ฿520 for their portion (so your net share was only ฿2,280). In your private chat, tap **✂️ Split → ✏️ My share was…** to open a small **Your share** panel inside Telegram. It shows the original slip total and a box for your amount.
 
-Reply with either:
+Enter either, then tap **Save my share**:
 - The exact amount: `2280` (or `2,280` or `฿2280`)
 - Or simple arithmetic: `2800 - 520`
 
@@ -92,7 +91,11 @@ The entry updates to **฿2,280**, leaving a clear record on the card:
 ✅ Saved ฿2,280 — Food
 ✏️ My share — ฿2,800 on the slip
 ```
-If you change your mind during the prompt, tap **◀️ Back** or send `/cancel`.
+Saving updates the original chat card and closes the panel. **Cancel** closes it without changing your spending. Your share must be above zero and cannot exceed the slip total. If a panel expires after an hour, close it, tap **Back**, then **Split** to open a fresh one. If the card cannot refresh, the panel confirms the amount was saved and `/dashboard` shows it.
+
+If the expense changes while a panel is open, the panel asks you to reopen Split instead of overwriting the newer change. Retrying Save cannot reverse a later Undo. Delayed card refreshes retry automatically; while one is pending, the panel confirms that your share is saved.
+
+In group chats (or local development without HTTPS), the bot still asks you to reply with the amount. Tap **◀️ Back** or send `/cancel` to cancel that prompt.
 
 ### 🗓 Across months — *one payment covering many months*
 

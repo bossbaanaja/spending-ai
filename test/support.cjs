@@ -68,4 +68,16 @@ async function fixture(db, repo, group = 'g') {
   const [item] = await repo.listBatchItems(db, batch.id);
   return { user, batch, item };
 }
-module.exports = { database, loader, fixture, slip };
+/** Split schema scripts while keeping trigger bodies intact for D1 prepare(). */
+function sqlStatements(script) {
+  const statements = [];
+  let pending = '';
+  for (const piece of script.replace(/--[^\r\n]*/g, '').split(';')) {
+    pending += piece + ';';
+    if (/^\s*CREATE TRIGGER/i.test(pending) && !/\bEND\s*;\s*$/i.test(pending)) continue;
+    if (pending.replace(/[;\s]/g, '')) statements.push(pending.trim());
+    pending = '';
+  }
+  return statements;
+}
+module.exports = { database, loader, fixture, slip, sqlStatements };

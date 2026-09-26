@@ -5,6 +5,8 @@ import { getUserByTelegramId } from './db/repo';
 import { intakeQueuedAlbum, processAlbumJob } from './bot/albumWorker';
 import { recoverAlbumJobs } from './services/albumQueue';
 import { AlbumTrace } from './services/timing';
+import { handleSplitPanel } from './web/splitPanelHandler';
+import { recoverTransactionCards } from './bot/cardRefresh';
 
 // If Telegram doesn't get a 200 in time (we now hold the response while model
 // calls run), it redelivers the update. Isolate-local dedup is enough: the
@@ -23,6 +25,9 @@ function safeEqual(a: string, b: string): boolean {
 export default {
   async fetch(request, env, ctx): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname === '/split-panel' || url.pathname.startsWith('/split-panel/')) {
+      return handleSplitPanel(request, env);
+    }
 
     if (request.method === "POST" && url.pathname === "/webhook") {
       const secret = request.headers.get("x-telegram-bot-api-secret-token") ?? "";
@@ -90,7 +95,7 @@ export default {
       // and every internal retry loop caps itself under this ceiling so a
       // too-slow call fails with a "try again" message instead of a stuck
       // status bubble.
-      const bot = getBot(env);
+      const bot = getBot(env, url.origin);
       const work = bot
         .init()
         .then(() => bot.handleUpdate(update))
@@ -108,7 +113,7 @@ export default {
 
   async scheduled(controller, env): Promise<void> {
     if (controller.cron === '0 22 * * *') await sendDailyReports(env, controller.scheduledTime);
-    else await recoverAlbumJobs(env);
+    else await Promise.all([recoverAlbumJobs(env), recoverTransactionCards(env)]);
   },
 
   async queue(batch, env): Promise<void> {

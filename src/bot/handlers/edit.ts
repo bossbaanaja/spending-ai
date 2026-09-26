@@ -5,6 +5,9 @@ import {
   deleteTransaction,
   getLatestTransaction,
   getTransaction,
+  getVersionedTransaction,
+  getTransactionCardJob,
+  requestTransactionCard,
   setPendingCustomSplit,
   splitByMonths,
   splitByPeople,
@@ -13,9 +16,11 @@ import {
 } from "../../db/repo";
 import { getBatch, getAlbumJob, isBatchAnswerable, resumeAlbumQuestion } from "../../db/repo";
 import { isSplitCount } from "../../split";
+import { createSplitPanelToken } from "../../services/splitPanelAuth";
 import { asCategory } from "../../types";
 import { advanceNoteWalk, completeBatchWithNote, finishNoteWalk, startNoteWalk } from "../batch";
 import type { BotContext } from "../bot";
+import { flushTransactionCard } from '../cardRefresh';
 import { fmtAmount, formatTxCard } from "../card";
 import {
   splitCountKeyboard,
@@ -27,6 +32,38 @@ import {
 
 /** Inline-button callbacks (change category, split, delete) + /undo. */
 export function registerEdit(bot: Bot<BotContext>) {
+  // Card-changing callbacks and panel saves share one durable sender. Menu navigation
+  // still edits normally; these writes render fresh database state, never a stale snapshot.
+  bot.on('callback_query:data', async (ctx, next) => {
+    const data = ctx.callbackQuery.data;
+    const mutation = /^(cat|del|unsplit):\d+(?::.*)?$|^(splitp|splitm):\d+:\d+$|^(delgrp|undoconfirm):/.test(data);
+    const messageId = ctx.callbackQuery.message?.message_id;
+    if (!mutation || !ctx.dbUser || !ctx.chat || !messageId) return next();
+    let job = await getTransactionCardJob(ctx.env.DB, ctx.chat.id, messageId);
+    if (job) {
+      const current = await getVersionedTransaction(ctx.env.DB, job.tx_id, ctx.dbUser.id);
+      if (!current || current.identity !== job.identity) {
+        await ctx.answerCallbackQuery({ text: 'That entry no longer exists.' });
+        return;
+      }
+    }
+    if (!job) {
+      const id = Number(data.split(':')[1]);
+      const tx = Number.isSafeInteger(id) ? await getVersionedTransaction(ctx.env.DB, id, ctx.dbUser.id) : null;
+      if (tx) {
+        await requestTransactionCard(ctx.env.DB, tx.id, ctx.dbUser.id, tx.identity, ctx.chat.id, messageId);
+        job = await getTransactionCardJob(ctx.env.DB, ctx.chat.id, messageId);
+      }
+    }
+    if (job) {
+      const chatId = ctx.chat.id;
+      ctx.editMessageText = async () => {
+        await flushTransactionCard(ctx.env, chatId, messageId);
+        return true as const;
+      };
+    }
+    return next();
+  });
   bot.callbackQuery(/^cat:(\d+):(.+)$/, async (ctx) => {
     const user = ctx.dbUser;
     if (!user) return;
@@ -59,19 +96,29 @@ export function registerEdit(bot: Bot<BotContext>) {
     const user = ctx.dbUser;
     if (!user) return;
     await deletePendingCustomSplit(ctx.env.DB, user.id);
-    const tx = await getTransaction(ctx.env.DB, Number(ctx.match[1]), user.id);
+    const tx = await getVersionedTransaction(ctx.env.DB, Number(ctx.match[1]), user.id);
     if (!tx) {
       await ctx.answerCallbackQuery({ text: "That entry no longer exists." });
       return;
     }
     const total = tx.original_amount ?? tx.amount;
     await ctx.answerCallbackQuery();
+    if (tx.split_kind === 'month') {
+      await ctx.editMessageText(formatTxCard(tx), { reply_markup: txKeyboard(tx) });
+      return;
+    }
+    let panelUrl: string | undefined;
+    const messageId = ctx.callbackQuery.message?.message_id;
+    if (ctx.chat?.type === 'private' && messageId && ctx.panelOrigin.startsWith('https://')) {
+      const token = await createSplitPanelToken(ctx.env.BOT_TOKEN, ctx.from.id, tx.id, messageId, tx);
+      panelUrl = `${ctx.panelOrigin}/split-panel?token=${encodeURIComponent(token)}`;
+    }
     await ctx.editMessageText(
       `Split ${fmtAmount(total, tx.currency)}${tx.note ? ` (${tx.note})` : ""} — how?\n\n` +
         "👥 Between people — you paid for the group, keep only your share.\n" +
         "✏️ My share was… — enter the exact amount you paid.\n" +
         "🗓 Across months — one payment that covers several months.",
-      { reply_markup: splitModeKeyboard(tx.id) },
+      { reply_markup: splitModeKeyboard(tx.id, panelUrl) },
     );
   });
 
@@ -146,7 +193,7 @@ export function registerEdit(bot: Bot<BotContext>) {
 
     const updated = await splitByMonths(ctx.env.DB, Number(ctx.match[1]), user.id, months);
     if (!updated) {
-      await ctx.answerCallbackQuery({ text: "That entry is gone, or is already spread over months." });
+      await ctx.answerCallbackQuery({ text: "That entry changed. Open Split again to check its current amount." });
       return;
     }
     await ctx.answerCallbackQuery({ text: `Split into ${months} monthly parts.` });
