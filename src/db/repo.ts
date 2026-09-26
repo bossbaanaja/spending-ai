@@ -134,7 +134,14 @@ export async function updateNote(
 }
 
 export async function deleteTransaction(db: D1Database, id: number, userId: number): Promise<boolean> {
-  const res = await db.prepare("DELETE FROM transactions WHERE id = ? AND user_id = ?").bind(id, userId).run();
+  // An unfinished custom split references this row. Clear only the target's
+  // prompt, atomically with deletion, so it cannot block Undo or Delete.
+  const [, res] = await db.batch([
+    db.prepare(`DELETE FROM pending_splits WHERE user_id = ? AND tx_id IN
+      (SELECT id FROM transactions WHERE id = ? AND user_id = ?)`).bind(userId, id, userId),
+    db.prepare("DELETE FROM transactions WHERE id = ? AND user_id = ?").bind(id, userId),
+  ]);
+  if (!res) throw new Error("transaction deletion returned no result");
   return res.meta.changes > 0;
 }
 
@@ -379,10 +386,12 @@ export async function undoSplit(db: D1Database, id: number, userId: number): Pro
 
 /** Deletes every part of a month-split at once, so no orphan instalments are left behind. */
 export async function deleteSplitGroup(db: D1Database, group: string, userId: number): Promise<number> {
-  const res = await db
-    .prepare("DELETE FROM transactions WHERE split_group = ? AND user_id = ?")
-    .bind(group, userId)
-    .run();
+  const [, res] = await db.batch([
+    db.prepare(`DELETE FROM pending_splits WHERE user_id = ? AND tx_id IN
+      (SELECT id FROM transactions WHERE split_group = ? AND user_id = ?)`).bind(userId, group, userId),
+    db.prepare("DELETE FROM transactions WHERE split_group = ? AND user_id = ?").bind(group, userId),
+  ]);
+  if (!res) throw new Error("split group deletion returned no result");
   return res.meta.changes;
 }
 
