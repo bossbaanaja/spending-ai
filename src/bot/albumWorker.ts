@@ -177,7 +177,20 @@ async function runAlbumJob(env: Env, batchId: number, trace: AlbumTrace): Promis
       const id = await trace.measure('status_update', () => albumMessage(env, batch!.chat_id, text, batch!.status_message_id, keyboard));
       await setBatchStatusMessage(db, batchId, id);
       trace.event('status_delivered', { state: remaining.length ? 'processing' : !currentJob?.note_mode && ready.length ? 'awaiting_note' : currentJob?.note_mode === 'each' ? 'individual_notes' : 'done' });
-      if (!remaining.length && currentJob?.note_mode === 'each' && batch.state !== 'asking') {
+      // At most two cards per delivery, bounded independently from saving.
+      let sent = 0;
+      for (const item of finalItems) {
+        if (item.outcome !== 'saved' || !item.tx_id) continue;
+        if ((await getAlbumItemWork(db, item.id))?.card_message_id) continue;
+        const tx = await getTransaction(db, item.tx_id, user.id);
+        if (!tx) continue;
+        if (sent++ >= 2) { notificationFailed = true; break; }
+        const id = await trace.measure('expense_card', () => albumMessage(env, batch!.chat_id, formatTxCard(tx), null, txKeyboard(tx)));
+        await markAlbumCard(db, item.id, id);
+        trace.event('card_delivered', { itemId: item.id });
+      }
+      // Keep the slip tracker below every card, including cards deferred to a later delivery.
+      if (!remaining.length && !notificationFailed && currentJob?.note_mode === 'each' && batch.state !== 'asking') {
         const active = await getActiveQuestion(db, user.id);
         if (active?.kind === 'album' && active.target_id === batchId) {
           const first = tally.saved[0];
@@ -194,18 +207,6 @@ async function runAlbumJob(env: Env, batchId: number, trace: AlbumTrace): Promis
             await clearAlbumQuestion(db, user.id, batchId, token);
           }
         }
-      }
-      // At most two cards per delivery, bounded independently from saving.
-      let sent = 0;
-      for (const item of finalItems) {
-        if (item.outcome !== 'saved' || !item.tx_id) continue;
-        if ((await getAlbumItemWork(db, item.id))?.card_message_id) continue;
-        const tx = await getTransaction(db, item.tx_id, user.id);
-        if (!tx) continue;
-        if (sent++ >= 2) { notificationFailed = true; break; }
-        const id = await trace.measure('expense_card', () => albumMessage(env, batch!.chat_id, formatTxCard(tx), null, txKeyboard(tx)));
-        await markAlbumCard(db, item.id, id);
-        trace.event('card_delivered', { itemId: item.id });
       }
     } catch (error) {
       const attempts = await recordAlbumDeliveryFailure(db, batchId, token, String(error));
