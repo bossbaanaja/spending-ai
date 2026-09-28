@@ -9,7 +9,7 @@
     "types": "wrangler types",
     "check": "tsc --noEmit",
     "test": "node --test test/*.test.cjs",
-    "test:runtime": "wrangler deploy --dry-run --outdir scratch/album-worker-build && node --test test/album-runtime.cjs test/split-panel-runtime.cjs",
+    "test:runtime": "wrangler deploy --dry-run --outdir scratch/album-worker-build && node --test test/album-runtime.cjs test/split-panel-runtime.cjs test/spending-month-runtime.cjs",
     "db:apply": "wrangler d1 execute spending_ai --remote --file=src/db/schema.sql",
     "db:apply:local": "wrangler d1 execute spending_ai --local --file=src/db/schema.sql"
   },

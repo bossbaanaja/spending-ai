@@ -20,9 +20,9 @@ function dateLabel(date: string): string {
 }
 
 export function formatDailyReport(summary: DailyUserSummary, date: string): string {
-  const lines = [`🌅 Yesterday's spending — ${dateLabel(date)}`];
+  const lines = [`🌅 Recorded expenses paid yesterday — ${dateLabel(date)}`];
   if (summary.count === 0) {
-    lines.push("", "No spending recorded yesterday.");
+    lines.push("", "No payment-date expenses recorded yesterday.");
     return lines.join("\n");
   }
 
@@ -44,7 +44,7 @@ export function formatDailyReport(summary: DailyUserSummary, date: string): stri
   for (const category of summary.byCategory) {
     lines.push(`${category.category}: ${fmtAmount(category.total, category.currency)}`);
   }
-  lines.push("", "Use /dashboard to see your monthly summary.");
+  lines.push("", "Use /dashboard for monthly spending; assigned spending months can differ from payment dates.");
   return lines.join("\n");
 }
 

@@ -1,3 +1,4 @@
+import { registerSpendingMonth } from "./handlers/spendingMonth";
 import { Bot, type Context } from "grammy";
 import { getUserByTelegramId } from "../db/repo";
 import type { UserRow } from "../types";
@@ -48,6 +49,7 @@ export function getBot(env: Env, panelOrigin = ''): Bot<BotContext> {
     await next();
   });
 
+  registerSpendingMonth(bot);
   registerEdit(bot); // callbacks + /undo
   registerHelp(bot);
   registerDashboard(bot);

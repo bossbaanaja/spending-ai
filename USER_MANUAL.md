@@ -176,3 +176,14 @@ For modifications and deletions, the assistant will display confirmation buttons
 - If you send a plain text message when no slip is pending a note, it routes directly to the AI chat assistant.
 - Slip reading is powered by AI vision and OCR, so always check the confirmation card, especially the amount and category, and adjust with the buttons if needed.
 - All amounts are tracked in Thai Baht (THB) unless the slip specifies otherwise.
+
+
+## Assign an expense to its spending month
+
+Tap **Spending month** on a saved expense card. Choose a month from the grid; the arrows switch years. The full recorded amount moves to that month's spending immediately. **Cancel** leaves it unchanged; **Use payment month** restores normal reporting.
+
+For example, a ฿3,000 hotel payment made in September for a November stay can count toward November. The original payment date stays visible. `/dashboard 2026-11` and monthly spending questions include it, even before November begins.
+
+Daily notifications and payment-date questions still use the payment date and recorded share. Month-only expenses have no known usage day. These reports are not full bank-debit totals when splits are involved.
+
+You can assign your share of a people split, and changing or undoing that split preserves the assigned month. To spread an expense across multiple months, first clear the spending-month assignment. To assign an existing across-month split to one month, undo that split first.

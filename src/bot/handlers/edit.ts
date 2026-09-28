@@ -117,8 +117,8 @@ export function registerEdit(bot: Bot<BotContext>) {
       `Split ${fmtAmount(total, tx.currency)}${tx.note ? ` (${tx.note})` : ""} — how?\n\n` +
         "👥 Between people — you paid for the group, keep only your share.\n" +
         "✏️ My share was… — enter the exact amount you paid.\n" +
-        "🗓 Across months — one payment that covers several months.",
-      { reply_markup: splitModeKeyboard(tx.id, panelUrl) },
+        (tx.spending_month ? "To spread across months, first choose Use payment month in Spending month." : "🗓 Across months — one payment that covers several months."),
+      { reply_markup: splitModeKeyboard(tx.id, panelUrl, Boolean(tx.spending_month)) },
     );
   });
 
@@ -128,6 +128,13 @@ export function registerEdit(bot: Bot<BotContext>) {
     if (user) await deletePendingCustomSplit(ctx.env.DB, user.id);
     const mode = ctx.match[1] as "splitp" | "splitm";
     const txId = Number(ctx.match[2]);
+    if (mode === "splitm" && user) {
+      const tx = await getTransaction(ctx.env.DB, txId, user.id);
+      if (tx?.spending_month) {
+        await ctx.answerCallbackQuery({ text: "Clear Spending month before spreading across months." });
+        return;
+      }
+    }
     await ctx.answerCallbackQuery();
     await ctx.editMessageText(
       mode === "splitp"

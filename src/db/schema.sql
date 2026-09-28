@@ -18,6 +18,11 @@ CREATE TABLE IF NOT EXISTS transactions (
   bank TEXT,
   trans_ref TEXT UNIQUE,            -- dedup: same slip can't be logged twice
   slip_datetime TEXT,               -- when the transfer actually happened
+  spending_month TEXT
+  CHECK (spending_month IS NULL OR
+    (spending_month GLOB '[1-9][0-9][0-9][0-9]-[0-1][0-9]'
+     AND spending_month >= '1900-01' AND substr(spending_month, 6, 2) BETWEEN '01' AND '12'
+     AND (split_kind IS NULL OR split_kind <> 'month'))),
   raw_json TEXT,                    -- full extraction, for auditing/reprocessing
   source_item_id TEXT UNIQUE,       -- user:media-group:message identity, independent of OCR
   created_at TEXT DEFAULT (datetime('now')),

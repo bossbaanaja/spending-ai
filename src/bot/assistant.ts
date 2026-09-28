@@ -1,3 +1,4 @@
+import { isSpendingMonth, paymentDate } from "../spendingMonth";
 import { InlineKeyboard } from "grammy";
 import {
   getLatestTransaction,
@@ -34,7 +35,7 @@ const TOOLS: NimTool[] = [
     function: {
       name: "get_month_summary",
       description:
-        "Get one month's spending summary: total, entry count, per-category totals, top merchants, and per-day totals.",
+        "Get one month's spending by assigned spending month: total, count, categories, merchants, and daily breakdown. Day unspecified means month-only usage.",
       parameters: {
         type: "object",
         properties: {
@@ -48,12 +49,13 @@ const TOOLS: NimTool[] = [
     function: {
       name: "list_transactions",
       description:
-        "List logged spending entries, newest first. `total` and `count` cover EVERY entry the filters match, even when the returned list is truncated — always quote those for 'how much' questions. Use filters to answer questions like 'what did I spend on food last week'.",
+        "List logged entries. Use spending_month for monthly usage spending, including future months; date_from/date_to filter payment-date records and must not be combined with spending_month. Month splits are allocation records, not full bank debits. Newest payment date first. `total` and `count` cover EVERY entry the filters match, even when the returned list is truncated — always quote those for 'how much' questions. Use filters to answer questions like 'what did I spend on food last week'.",
       parameters: {
         type: "object",
         properties: {
           category: { type: "string", enum: [...CATEGORIES] },
           receiver: { type: "string", description: "Match merchants/recipients whose name contains this text." },
+          spending_month: { type: "string", description: 'Usage spending month YYYY-MM; use for monthly spending lists and category totals. Includes future allocations.' },
           date_from: { type: "string", description: 'Earliest date, "YYYY-MM-DD" (inclusive).' },
           date_to: { type: "string", description: 'Latest date, "YYYY-MM-DD" (inclusive).' },
           limit: { type: "integer", description: "Max entries to return (default 20, max 100)." },
@@ -112,6 +114,9 @@ function systemPrompt(): string {
 Rules:
 - For any question about the user's spending, call a tool. NEVER state or estimate an amount that did not come from a tool result, and never compute new totals or percentages yourself — quote figures exactly as the tools return them.
 - When the user asks to change or remove an entry, use propose_edit_category or propose_delete — the user confirms with a button, you never change data yourself.
+- Monthly spending uses assigned spending months: get_month_summary for summaries, list_transactions with spending_month for lists or filtered totals. Never use payment-date bounds to answer monthly usage spending. Explicit payment questions use date_from/date_to; label these as payment-date records, not full bank debits (splits retain recorded shares).
+- Day/week usage spending cannot fully place month-only allocations. Explain this and offer monthly spending or explicitly labeled payment-date records. Never invent a usage day. The unspecified day bucket is month-only spending.
+- To move an expense to another month, tell the user to tap Spending month on its saved card. You cannot write month assignments.
 - Months are "YYYY-MM", dates are "YYYY-MM-DD" (convert Buddhist Era years: subtract 543).
 - Reply in the user's language (Thai or English). Keep replies short — this is a chat. Plain text only, no markdown.
 - If the request has nothing to do with spending tracking, do not call a tool — briefly say what you can help with instead.
@@ -255,13 +260,15 @@ function findCategory(value: unknown): Category | undefined {
 }
 
 function txDate(tx: TransactionRow): string {
-  return (tx.slip_datetime ?? tx.created_at).slice(0, 10);
+  return paymentDate(tx);
 }
 
 function txPayload(tx: TransactionRow) {
   return {
     id: tx.id,
-    date: txDate(tx),
+    payment_date: txDate(tx),
+    spending_month: tx.spending_month ?? txDate(tx).slice(0, 7),
+    usage_day_unspecified: Boolean(tx.spending_month),
     amount: tx.amount,
     currency: tx.currency,
     category: tx.category,
@@ -273,7 +280,7 @@ function txPayload(tx: TransactionRow) {
 
 function txLine(tx: TransactionRow): string {
   const what = tx.note ?? tx.receiver ?? tx.category;
-  return `• ${txDate(tx)} — ${fmtAmount(tx.amount, tx.currency)} ${tx.category} (${what})`;
+  return `• ${txDate(tx)} — ${fmtAmount(tx.amount, tx.currency)} ${tx.category} (${what})${tx.spending_month ? ` — counts toward ${tx.spending_month}; usage day unspecified` : ""}`;
 }
 
 function formatSummary(s: MonthSummary): string {
@@ -296,7 +303,7 @@ async function runReadTool(
   switch (tc.function.name) {
     case "get_month_summary": {
       const raw = asOptString(args.month);
-      const month = raw && /^\d{4}-\d{2}$/.test(raw) ? raw : bangkokToday().slice(0, 7);
+      const month = raw && isSpendingMonth(raw) ? raw : bangkokToday().slice(0, 7);
       const summary = await getMonthSummary(env.DB, user.id, month);
       return { payload: summary, fallback: formatSummary(summary) };
     }
@@ -309,7 +316,12 @@ async function runReadTool(
           fallback: null,
         };
       }
+      const month = asOptString(args.spending_month);
+      if (month && (!isSpendingMonth(month) || args.date_from || args.date_to)) {
+        return { payload: { error: "Choose a valid spending_month OR payment dates, not both." }, fallback: "Please choose a spending month or a payment-date range." };
+      }
       const filters = {
+        spendingMonth: month,
         category,
         receiver: asOptString(args.receiver),
         dateFrom: asOptString(args.date_from),
@@ -324,7 +336,9 @@ async function runReadTool(
         sumTransactions(env.DB, user.id, filters),
       ]);
       const notShown = sum.count - rows.length;
+      const basis = month ? `Spending month ${month}` : "Payment-date records (recorded shares; not full bank debits)";
       const payload = {
+        basis,
         count: sum.count,
         total: sum.total,
         returned: rows.length,
@@ -336,9 +350,9 @@ async function runReadTool(
       // messages. "…more" only remains past the 100-row fetch cap.
       const fallback =
         sum.count === 0
-          ? "No matching entries found."
+          ? `${basis}: no matching entries found.`
           : [
-              `${sum.count} entr${sum.count === 1 ? "y" : "ies"}, total ${fmtAmount(sum.total)}:`,
+              `${basis}: ${sum.count} entr${sum.count === 1 ? "y" : "ies"}, total ${fmtAmount(sum.total)}:`,
               ...rows.map(txLine),
               ...(notShown > 0 ? [`…and ${notShown} more — ask a narrower date range to see them.`] : []),
             ].join("\n");

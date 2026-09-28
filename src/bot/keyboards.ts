@@ -10,6 +10,8 @@ export function txKeyboard(tx: TransactionRow): InlineKeyboard {
     if (i % 4 === 3) kb.row();
   });
 
+  if (tx.split_kind !== "month") kb.text("📅 Spending month", `month:${tx.id}`).row();
+
   // An entry already spread over months hides Split: dividing one instalment
   // again would be ambiguous. Split by people first, spread second.
   if (tx.split_kind !== "month") kb.text("✂️ Split", `split:${tx.id}`);
@@ -42,15 +44,14 @@ export function batchAskKeyboard(batchId: number, index = 0): InlineKeyboard {
 }
 
 /** Step 1 of the split flow: which kind of split. */
-export function splitModeKeyboard(txId: number, panelUrl?: string): InlineKeyboard {
+export function splitModeKeyboard(txId: number, panelUrl?: string, deferred = false): InlineKeyboard {
   const kb = new InlineKeyboard()
     .text("👥 Between people", `splitp:${txId}`)
     .row();
   if (panelUrl) kb.webApp("✏️ My share was…", panelUrl);
   else kb.text("✏️ My share was…", `splitc:${txId}`);
+  if (!deferred) kb.row().text("🗓 Across months", `splitm:${txId}`);
   return kb.row()
-    .text("🗓 Across months", `splitm:${txId}`)
-    .row()
     .text("◀️ Back", `splitback:${txId}`);
 }
 

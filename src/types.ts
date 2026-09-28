@@ -53,6 +53,7 @@ export interface TransactionRow {
   bank: string | null;
   trans_ref: string | null;
   slip_datetime: string | null;
+  spending_month: string | null;
   raw_json: string | null;
   created_at: string;
   // Split bookkeeping — all null on an ordinary entry.

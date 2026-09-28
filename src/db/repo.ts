@@ -1,3 +1,4 @@
+import { isSpendingMonth, paymentDate } from "../spendingMonth";
 import { divideAmount, monthParts } from "../split";
 import type {
   BatchItemOutcome,
@@ -13,8 +14,9 @@ import type {
 } from "../types";
 
 // COALESCE: prefer the datetime printed on the slip; fall back to when we logged it.
-const MONTH_EXPR = "substr(COALESCE(slip_datetime, created_at), 1, 7)";
-const DAY_EXPR = "substr(COALESCE(slip_datetime, created_at), 9, 2)";
+const PAYMENT_EXPR = "COALESCE(slip_datetime, datetime(created_at, '+7 hours'))";
+const MONTH_EXPR = `COALESCE(spending_month, substr(${PAYMENT_EXPR}, 1, 7))`;
+const DAY_EXPR = `CASE WHEN spending_month IS NOT NULL THEN 'unspecified' ELSE substr(${PAYMENT_EXPR}, 9, 2) END`;
 
 /** Today in Bangkok time (UTC+7) as "YYYY-MM-DD". */
 function bangkokToday(): string {
@@ -297,7 +299,7 @@ export async function splitByMonths(
   months: number,
 ): Promise<TransactionRow | null> {
   const tx = await getVersionedTransaction(db, id, userId);
-  if (!tx || tx.split_kind === "month") return null;
+  if (!tx || tx.split_kind === "month" || tx.spending_month) return null;
 
   const group = crypto.randomUUID();
   const [first, ...rest] = monthParts(tx, months);
@@ -311,7 +313,7 @@ export async function splitByMonths(
         `UPDATE transactions
             SET amount = ?, slip_datetime = ?, original_amount = COALESCE(original_amount, amount),
                 split_kind = 'month', split_group = ?, split_part = 1, split_total = ?
-          WHERE id = ? AND user_id = ?
+          WHERE id = ? AND user_id = ? AND spending_month IS NULL
             AND EXISTS (SELECT 1 FROM transaction_versions WHERE tx_id = transactions.id AND identity = ? AND revision = ?)
           RETURNING *`,
       )
@@ -396,6 +398,7 @@ export async function deleteSplitGroup(db: D1Database, group: string, userId: nu
 }
 
 export interface TxFilters {
+  spendingMonth?: string;
   category?: Category;
   /** Substring match against the receiver/merchant name. */
   receiver?: string;
@@ -408,7 +411,7 @@ export interface TxFilters {
 /** WHERE clause + binds shared by the filtered list and its true-total aggregate,
  * so the two can never disagree about which rows a filter matches. */
 function txFilterWhere(userId: number, filters: TxFilters): { where: string; binds: (string | number)[] } {
-  const DATE_EXPR = "substr(COALESCE(slip_datetime, created_at), 1, 10)";
+  const DATE_EXPR = `substr(${PAYMENT_EXPR}, 1, 10)`;
   const conds = ["user_id = ?"];
   const binds: (string | number)[] = [userId];
 
@@ -419,6 +422,14 @@ function txFilterWhere(userId: number, filters: TxFilters): { where: string; bin
   if (filters.receiver) {
     conds.push("receiver LIKE ? ESCAPE '\\'");
     binds.push(`%${filters.receiver.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`);
+  }
+  if (filters.spendingMonth) {
+    if (!isSpendingMonth(filters.spendingMonth) || filters.dateFrom || filters.dateTo) {
+      throw new Error('Use a valid spending month OR payment dates, not both.');
+    }
+    conds.push(`${MONTH_EXPR} = ?`);
+    binds.push(filters.spendingMonth);
+    return { where: conds.join(" AND "), binds };
   }
   if (filters.dateFrom) {
     conds.push(`${DATE_EXPR} >= ?`);
@@ -441,7 +452,7 @@ export async function listTransactions(db: D1Database, userId: number, filters: 
   const res = await db
     .prepare(
       `SELECT * FROM transactions WHERE ${where}
-       ORDER BY COALESCE(slip_datetime, created_at) DESC LIMIT ${limit}`,
+       ORDER BY ${PAYMENT_EXPR} DESC LIMIT ${limit}`,
     )
     .bind(...binds)
     .all<TransactionRow>();
@@ -1031,7 +1042,7 @@ export interface MonthSummary {
   count: number;
   byCategory: { category: string; total: number }[];
   topReceivers: { receiver: string; total: number; count: number }[];
-  byDay: { day: string; total: number }[]; // day = "01".."31"
+  byDay: { day: string; total: number }[]; // day = "01".."31" or "unspecified" for month-only allocations
 }
 
 export async function getMonthSummary(db: D1Database, userId: number, month: string): Promise<MonthSummary> {
@@ -1136,4 +1147,27 @@ export async function getDailyUserSummaries(db: D1Database, date: string): Promi
     summaries.set(row.telegram_id, summary);
   }
   return [...summaries.values()];
+}
+
+
+export async function getTransactionByIdentity(db: D1Database, identity: string, userId: number): Promise<VersionedTransaction | null> {
+  return db.prepare(`SELECT t.*, v.identity, v.revision, v.split_token FROM transactions t
+    JOIN transaction_versions v ON v.tx_id = t.id WHERE v.identity = ? AND t.user_id = ?`)
+    .bind(identity, userId).first<VersionedTransaction>();
+}
+
+/** Compare-and-swap makes replay and overlapping picker saves harmless. */
+export async function setSpendingMonth(db: D1Database, userId: number,
+  expected: { identity: string; revision: number }, month: string | null): Promise<boolean> {
+  if (month !== null && !isSpendingMonth(month)) return false;
+  const tx = await getTransactionByIdentity(db, expected.identity, userId);
+  if (!tx || tx.revision !== expected.revision || tx.split_kind === 'month') return false;
+  const value = month === paymentDate(tx).slice(0, 7) ? null : month;
+  const result = await db.prepare(`UPDATE transactions SET spending_month = ?
+    WHERE id = ? AND user_id = ? AND (split_kind IS NULL OR split_kind <> 'month')
+    AND EXISTS (SELECT 1 FROM transaction_versions WHERE tx_id = transactions.id AND identity = ? AND revision = ?)
+    RETURNING id`)
+    .bind(value, tx.id, userId, expected.identity, expected.revision).first<{ id: number }>();
+  // D1's changes count includes trigger writes; RETURNING identifies the expense itself.
+  return result?.id === tx.id;
 }

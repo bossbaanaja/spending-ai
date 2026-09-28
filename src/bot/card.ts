@@ -1,3 +1,4 @@
+import { monthLabel } from "../spendingMonth";
 import type { InlineKeyboard } from "grammy";
 import { insertTransaction } from "../db/repo";
 import { monthRangeLabel } from "../split";
@@ -14,6 +15,7 @@ export function fmtAmount(amount: number, currency = "THB"): string {
 
 export function formatTxCard(tx: TransactionRow): string {
   const lines = [`✅ Saved ${fmtAmount(tx.amount, tx.currency)} — ${tx.category}`];
+  if (tx.spending_month) lines.push(`📅 Counts toward: ${monthLabel(tx.spending_month)}`);
   const split = formatSplitLine(tx);
   if (split) lines.push(split);
   if (tx.note) lines.push(`📝 ${tx.note}`);
@@ -21,7 +23,7 @@ export function formatTxCard(tx: TransactionRow): string {
   const bankLine = [tx.bank, tx.slip_datetime].filter(Boolean).join(" · ");
   if (bankLine) lines.push(`🏦 ${bankLine}`);
   if (tx.trans_ref) lines.push(`ref: ${tx.trans_ref}`);
-  lines.push("", "Wrong category? Tap below to fix it.");
+  lines.push("", "Use the buttons below to edit this expense.");
   return lines.join("\n");
 }
 

@@ -1,3 +1,4 @@
+import { isSpendingMonth } from "../../spendingMonth";
 import type { Bot } from "grammy";
 import { getMonthSummary } from "../../db/repo";
 import { buildCategoryChartUrl } from "../../services/chart";
@@ -26,7 +27,7 @@ export function registerDashboard(bot: Bot<BotContext>) {
     if (!user) return;
 
     const arg = (ctx.match ?? "").trim();
-    const month = /^\d{4}-\d{2}$/.test(arg) ? arg : currentBangkokMonth();
+    const month = isSpendingMonth(arg) ? arg : currentBangkokMonth();
     const label = monthLabel(month);
 
     const summary = await getMonthSummary(ctx.env.DB, user.id, month);
@@ -39,7 +40,7 @@ export function registerDashboard(bot: Bot<BotContext>) {
     }
 
     const lines = [
-      `📊 ${label}`,
+      `📊 ${label} — spending month`,
       `Total: ${fmtAmount(summary.total)} across ${summary.count} slip${summary.count === 1 ? "" : "s"}`,
       "",
     ];
